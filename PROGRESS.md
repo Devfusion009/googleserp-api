@@ -48,3 +48,50 @@ Zero live requests made in this phase.
 ### Open questions
 - If Google shows "Can't generate an AI Overview right now", we classify it as aio_incomplete (failure). Client to confirm.
 - Manual fixtures come from an Indian IP with gl=us, so the page may differ a little from what a US proxy gets (ads, local results).
+
+## Fixtures — DONE (16/16, captured 2026-09-24)
+
+All 16 corpus pages captured via the user's normal (signed-in) Chrome, automated with
+the claude-in-chrome browser extension (not the Playwright fetcher — that's still
+blocked by the CAPTCHA from Phase 1). For each: navigated, checked for an AI Overview,
+clicked "Show more" and any sources "Show all" fully, downloaded the live DOM as HTML
+(`document.documentElement.outerHTML`), and stitched scroll-position screenshots into
+one PNG per fixture. Files in `tests/fixtures/<slug>.html` + `.png`, manifest updated.
+
+AI Overview present (11): t_mobile, mobile, apple, best_cell_phone_plans,
+car_insurance_quotes, crm_software, how_does_dns_work, why_is_the_sky_blue,
+best_supplements_for_sleep, how_to_replace_a_kitchen_faucet_cartridge_delta_1400_series,
+difficult_flights_to_brussels_from_shanghai.
+No AI Overview (5): wikipedia, chase_bank_login, coffee_shops_near_seattle,
+plumber_austin_tx, eiffel_tower — all plausible (navigational or local-pack queries).
+
+Bonus real fixtures found along the way (useful for the "skip" rules in Phase 3):
+- `coffee_shops_near_seattle`, `plumber_austin_tx`: local pack + map + "Businesses" module.
+- `plumber_austin_tx`: top/bottom text ads ("Sponsored Results"), one with an "Have AI get prices" button.
+- `eiffel_tower`: image carousel, "Sponsored Tickets & Tours" carousel (prices in INR - Google
+  used the real browsing IP's currency despite gl=us&hl=en), Knowledge Panel, world-map "Places"
+  block, short-videos carousel, "Discussions and forums" module.
+- `difficult_flights_to_brussels_from_shanghai`: flights module + "Flight status" module (both
+  must be skipped per the rules), AI Overview with inline source chips (no side "Show all" panel
+  this time — Google renders AIO sources two different ways).
+- `how_to_replace_a_kitchen_faucet_cartridge_delta_1400_series`: AI Overview correctly points
+  out the "1400 series" is a tub/shower valve, not a kitchen faucet part; one organic result
+  showed a "Missing: kitchen | Show results with: kitchen" line (a real corrections-adjacent case
+  to check against the `corrections` field rule).
+
+Caveat: captured while signed in to a Google account (not incognito), so a few pages show
+"Results are personalized" and a location note. Structure/fields should still be representative;
+noted here in case the client asks why ads/results don't match a clean/incognito session.
+
+Tooling notes for later fixture refreshes:
+- `scripts/save_fixture.py`: moves the newest downloaded HTML + screenshot from
+  `~/Downloads`, `~/Desktop/Downloads`, `~/Pictures/Screenshots` or the home directory
+  into `tests/fixtures/<slug>.{html,png}` (which directory Chrome uses varies by tab/profile).
+- `scripts/stitch_screenshots.py`: stacks scroll-position screenshots (`--since <unix ts>`)
+  into one tall PNG for a fixture (small vertical overlap between shots is normal).
+- Reliability quirk observed this session: after a tab has done one HTML download via
+  `URL.createObjectURL` + anchor click, a second download attempt in the *same* tab silently
+  fails about half the time (no dialog, no error, file never appears) and can also stall the
+  CDP screenshot channel until the download resolves. Workaround: one fresh tab per query,
+  download the HTML once per tab, never retry a failed download in the same tab — open a new
+  one instead. Filed as feedback.

@@ -1,98 +1,98 @@
 {
   "t_mobile": {
     "url": "https://www.google.com/search?q=t-mobile&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "wikipedia": {
     "url": "https://www.google.com/search?q=wikipedia&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "chase_bank_login": {
     "url": "https://www.google.com/search?q=chase%20bank%20login&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "mobile": {
     "url": "https://www.google.com/search?q=mobile&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "apple": {
     "url": "https://www.google.com/search?q=apple&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "best_cell_phone_plans": {
     "url": "https://www.google.com/search?q=best%20cell%20phone%20plans&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "car_insurance_quotes": {
     "url": "https://www.google.com/search?q=car%20insurance%20quotes&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "crm_software": {
     "url": "https://www.google.com/search?q=crm%20software&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "how_does_dns_work": {
     "url": "https://www.google.com/search?q=how%20does%20dns%20work&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "why_is_the_sky_blue": {
     "url": "https://www.google.com/search?q=why%20is%20the%20sky%20blue&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "best_supplements_for_sleep": {
     "url": "https://www.google.com/search?q=best%20supplements%20for%20sleep&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "coffee_shops_near_seattle": {
     "url": "https://www.google.com/search?q=coffee%20shops%20near%20seattle&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "plumber_austin_tx": {
     "url": "https://www.google.com/search?q=plumber%20austin%20tx&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "eiffel_tower": {
     "url": "https://www.google.com/search?q=eiffel%20tower&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "how_to_replace_a_kitchen_faucet_cartridge_delta_1400_series": {
     "url": "https://www.google.com/search?q=how%20to%20replace%20a%20kitchen%20faucet%20cartridge%20delta%201400%20series&gl=us&hl=en",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   },
   "difficult_flights_to_brussels_from_shanghai": {
     "url": "https://www.google.com/search?q=flights%20to%20brussels%20from%20shanghai&gl=us&hl=us",
-    "html": false,
-    "screenshot": false,
-    "source": null
+    "html": true,
+    "screenshot": true,
+    "source": "manual_chrome"
   }
 }
