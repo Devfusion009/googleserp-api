@@ -180,6 +180,11 @@ def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, di
             f"- Valid results: **{s['valid']}/{s['n']} ({s['valid_rate']:.1%})** - {pf(s['valid_pass'])}",
             f"- By classification: {', '.join(f'{k}={v}' for k, v in sorted(s['by_classification'].items()))}",
             f"- Latency (all requests, nearest-rank): P50 {s['p50']} ms, **P95 {s['p95']} ms** - {pf(s['p95_pass'])}, max {s['max']} ms",
+            *(
+                [f"- _Caution: only {s['valid']} of {s['n']} requests returned a valid result. The latency figures include fast "
+                 "failures (e.g. an instant CAPTCHA redirect), so a latency PASS here says nothing about real page load time._"]
+                if not s["valid_pass"] else []
+            ),
             "",
             "### Where the time goes (server-side stage averages, ms since request start)",
             "",

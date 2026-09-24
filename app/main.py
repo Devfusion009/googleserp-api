@@ -42,6 +42,21 @@ from .urls import InvalidUrl, page_url, validate_search_url
 
 log = logging.getLogger("serp.api")
 
+
+def _configure_logging() -> None:
+    """uvicorn only configures its own loggers; without this, every serp.*
+    line (URL sent, final URL, proxy used, classification, timings) is dropped."""
+    serp = logging.getLogger("serp")
+    if not serp.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        serp.addHandler(handler)
+        serp.setLevel(logging.INFO)
+        serp.propagate = False
+
+
+_configure_logging()
+
 RESULTS_PER_PAGE = 10
 
 # error code -> (classification match, http status) used to build the response

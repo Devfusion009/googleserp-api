@@ -179,3 +179,23 @@ no request reached Google.
   partial-failure flag. Confirm which the client's benchmark expects.
 
 ### Next: Phase 5 (local benchmark, max 20 live requests: 15 mixed + 5 difficult)
+
+## Phase 5 — Local benchmark — DONE (blocked, as expected)
+
+### Built (offline-tested before any live request)
+- `bench/run_bench.py`: HTTP client against the running API, `--corpus mixed|difficult|both`, `--repeat`, `--limit`, `--concurrency` (default 1), `--min-delay` (default MIN_DELAY_SECONDS, measured from when the previous request *finished*), refuses > MAX_LIVE_REQUESTS_PER_RUN without `--allow-more`, stops at the first `blocked_captcha`. Writes `reports/<run_id>/responses.jsonl` + `report.md`: per corpus valid rate + counts per classification, P50/P95/max over ALL requests (nearest-rank) with PASS/FAIL vs 98% / 2000 ms, AI Overview appeared/complete/avg sources per query, average stage timings (from `X-Timings`), top failure reasons with artifact paths. Local-run label on every report.
+- Error responses now also carry `X-AIO-State`, `X-Timings` and a new `X-Artifact-Dir` header (debug-only, body unchanged).
+- `tests/test_bench.py`: 7 tests (nearest-rank, planning, cap refusal, header parsing via in-process ASGI, summary/report incl. failures counted in latency, stop-at-first-CAPTCHA). 93 tests total, all passing.
+
+### Live run (user-approved, 2026-09-24 20:32, bundled Chromium, visible browser, no proxy)
+- Planned: 15 mixed, then 5 difficult. **Actual: 1 request.**
+- Request 1 (`t-mobile`): redirected to `/sorry/` - "unusual traffic from your computer network" (reCAPTCHA). Classified `blocked_captcha`, 1493 ms wall. Artifact: `artifacts/20260924_203228_t_mobile/`.
+- Run stopped immediately per the stop-at-first-CAPTCHA rule. The difficult corpus was **not run** (same IP, still flagged).
+- Report: `reports/20260924_203226/report.md` (git-ignored). Mixed: valid 0/1 (0.0%) FAIL. The "P95 1493 ms PASS" in that report is technically correct per the spec (failures count), but meaningless - it's the time to an instant CAPTCHA. The report now adds a caution line whenever the valid rate misses target (added after this run; the saved report predates it).
+- Conclusion: this home IP (Indian ISP, IPv6) is blocked for automated Chromium regardless of pacing - 2 of 2 attempts ~18 h apart. Local latency/valid-rate numbers cannot be produced from here; they need the client's US residential proxies (`PROXY_MODE=static|list`, config only).
+
+### Fixed because of the live run
+- The server log had none of the app's own lines (URL sent, final URL, proxy used, classification, timings): uvicorn only configures its own loggers. `app/main.py` now attaches a handler to the `serp` logger at import.
+
+### Still unverified live (needs an unblocked IP)
+- The fetcher's AI Overview wait/expand logic (appear -> stable -> click "Show more"/"Show all") has never run against a live page. Parsers are verified against real saved pages; the waiting/clicking is not.

@@ -103,6 +103,7 @@ def test_summarize_counts_all_requests_in_latency_and_reports_pass_fail():
     assert run_bench.LOCAL_LABEL in report
     assert "aio_incomplete" in report and "artifacts/a" in report
     assert "FAIL" in report
+    assert "Caution" in report  # latency caveat when valid rate misses target
 
 
 def test_run_stops_at_first_captcha(monkeypatch, tmp_path):
