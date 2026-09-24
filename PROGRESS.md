@@ -95,3 +95,31 @@ Tooling notes for later fixture refreshes:
   CDP screenshot channel until the download resolves. Workaround: one fresh tab per query,
   download the HTML once per tab, never retry a failed download in the same tab — open a new
   one instead. Filed as feedback.
+
+## Phase 3 — Parsers — IN PROGRESS (organic, ads, AIO, misc fields done; knowledge_panel not started)
+
+No live requests. Built and tested against the 16 real fixtures from Phase 2.
+
+### Done
+- `app/models.py`: pydantic models matching the client's JSON exactly (SerpRequest, OrganicItem/SubLink, AiOverview/AioSection/AioSource, KnowledgePanel, PageResult, SerpResponse).
+- `app/parsers/misc.py`: text-cleanup helpers (`clean_text`, `clean_prose` for punctuation spacing, `dedupe_consecutive` for the aria-hidden duplicate-text problem) plus `number_of_results` (from `#result-stats`), `suggestions` (from the *last* "Related searches"/"People also search for" block inside `#botstuff` - a knowledge panel can have an earlier one about related entities, not searches), `corrections` (untested - no fixture triggers it).
+- `app/parsers/organic.py`: walks every `<a><h3>` inside `#rso`, climbs to the nearest ancestor with `data-hveid` for the per-result boundary. URL resolution: real hrefs are used directly; `/url?q=` is unwrapped; Google's newer opaque `/goto?url=<token>` redirect (seen on ~1/3 of fixtures, cannot be decoded per the no-reverse-engineering rule) falls back to the visible `<cite>` breadcrumb text rebuilt into a URL - real on-page text, but sometimes only the site root if Google didn't show a fuller breadcrumb; logged as a parse warning each time. Sitelinks (`sub_links`) picked up when they're real anchors (jump-links, some sitelink rows); Google's "Web Result with Site Links" table layout (t_mobile.html) has *no hrefs in the DOM at all* for its sitelinks - `sub_links` is honestly empty there, not guessed.
+- `app/parsers/ads.py`: every `[data-text-ad]` inside `#tads`/`#bottomads`. Ad hrefs are the real destination directly; ad sitelinks sometimes route through `/aclk?...&adurl=<real_url>` and we read the `adurl` param.
+- `app/parsers/aio.py`: the AI Overview root (`classify.find_aio_root`) walked in document order. Section headings = `role=heading[aria-level="3"]`. Paragraphs = `.n6owBd`. Bullets = plain `<li>`. Sources = `<li class="h7wxwc">` (title `.gpZmoc`, url from `a.vIWmYe` - direct real href, snippet `.hxIQcc`); this class showed up in exactly the 11/16 fixtures that have an AI Overview and nowhere else, so it's a solid hook. The walk stops the moment it reaches the sources list, so the paragraph/bullet stream never picks up citation-panel text. Small inline citation pills (favicon + "Publisher +1") are stripped before reading text, or intro/section text would end with junk like "... tasks . Microsoft +1".
+- `scripts/demo_parse.py`: assembles one fixture into the exact response JSON (minus `knowledge_panel`, always null for now) so it can be eyeballed against the screenshot. Not the real API - that's Phase 4.
+- All 26 existing tests still pass; no new tests added yet for the parsers (next step, see below).
+
+### Verified against screenshots (3 examples, see chat)
+- `how_does_dns_work`: organic (9), AI Overview (intro + 3 sections + 3 sources) - matches the screenshot closely.
+- `car_insurance_quotes`: paid (2, incl. one duplicate ad shown twice on the real page), organic (10), AI Overview (intro + 2 sections + 9 sources, matching the fully-expanded "Show all") - matches.
+- `wikipedia`: organic only, `ai_overview: null` correctly, sitelinks null where Google gives no real href (the language-switcher row) - matches.
+
+### Known imperfect cases (real, not hidden)
+- Video-type organic results (e.g. the YouTube result on `how_does_dns_work`) pick up extra chrome (chapter timestamps, "8 key moments...", repeated view-count line) in `content` - that layout doesn't use the same content wrapper as a plain web result. Needs its own case.
+- Google's "Web Result with Site Links" layout (seen on `t_mobile`, `mobile`, `apple`, `best_cell_phone_plans`, `chase_bank_login`, `wikipedia` - fixtures using the `/goto` redirect style) falls back to a cruder snippet-by-subtraction and sometimes leaves in "About this result" or a stray split word (e.g. a bolded "T-Mobile" rendered as "T - Mobile"). Lower priority since `url`/`title` are still correct.
+- `corrections` is unverified - no query in the corpus triggers "Did you mean"/"Showing results for".
+- `knowledge_panel` is not implemented yet - always `null`. `eiffel_tower.html` and `apple.html`/`t_mobile.html` (via `#rhs`) have one; needs its own investigation pass.
+
+### Open questions for the client (collect for the README "assumptions" section)
+- Is the reconstructed-from-breadcrumb URL (used only when Google's own `/goto` redirect can't be decoded) acceptable, given it's occasionally just the site root instead of the deep link?
+- Is a slightly noisier `content` field acceptable for video-type organic results, or should those be cleaned up before Phase 4?
