@@ -199,3 +199,19 @@ no request reached Google.
 
 ### Still unverified live (needs an unblocked IP)
 - The fetcher's AI Overview wait/expand logic (appear -> stable -> click "Show more"/"Show all") has never run against a live page. Parsers are verified against real saved pages; the waiting/clicking is not.
+
+## Phase 6 — README + wrap-up — DONE
+
+- `README.md`: status table (honest: no live numbers yet), setup for Linux/macOS/Windows, how to run, curl + PowerShell examples, API contract with status/error table and debug headers, full config table, proxies, benchmark, tests, how each field is parsed (including the exact AI Overview intro/sections/sources mapping rules), assumptions for the client to confirm, known limitations, and what's still needed to reach >= 98% / P95 <= 2 s.
+- `run.py`: cross-platform launcher (sets the Windows Proactor event loop, never `--reload`).
+- `STOP_ON_BLOCK` was in the config but unused - now honoured by the benchmark and `capture_fixtures.py --live` (default `true`; `false` only makes sense with a rotating proxy list).
+- A parsed page with zero organic results now returns `degraded_page` (the brief's rule; the classifier alone only caught a missing results container).
+- Checked the skip rules on real pages: local packs, forums, People Also Ask, carousels and the flights module don't leak into `organic`.
+- 95 tests, all passing.
+
+### Done-when checklist
+- [x] POST /serp returns the exact schema or an honest error - verified offline on all 16 fixtures; live, every attempt from this IP returned an honest `blocked_captcha`.
+- [x] A test proves the difficult URL is passed through unchanged (fetcher level and API level).
+- [~] Every AI Overview visible in a screenshot is fully extracted with its sources - intro/sections on 11/11, sources on 7/11 (the other 4 are `/goto`-wrapped with no recoverable URL; documented). `ai_overview` is `null` only on the 5 pages without one.
+- [x] All tests pass; a local benchmark report exists (`reports/20260924_203226/`, blocked at request 1).
+- [x] Proxies switch on with config alone.

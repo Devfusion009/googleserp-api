@@ -208,3 +208,15 @@ def test_serp_response_headers_carry_debug_info(client_for):
     assert resp.headers["X-AIO-State"] == "absent"
     timings = json.loads(resp.headers["X-Timings"])
     assert timings["attempt"] == 1
+
+
+def test_serp_zero_organic_results_is_degraded_page(client_for):
+    url = "https://www.google.com/search?q=x&gl=us&hl=en"
+    empty = '<html><body><div id="search"><div id="rso"></div></div></body></html>'
+    fetcher = FakeFetcher([ok_result(url, html=empty)])
+    client = client_for(fetcher)
+    resp = client.post("/serp", json={"url": url, "results": 10})
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["error"] == "degraded_page"
+    assert body["results"] == []

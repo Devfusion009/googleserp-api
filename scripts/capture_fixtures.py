@@ -90,7 +90,7 @@ async def live(limit: int, allow_more: bool) -> None:
                 time.sleep(s.min_delay_seconds)
             r = await fetcher.fetch(url, "US", "en")
             print(f"{slug}: {r.classification.value} ({r.reason}) aio={r.aio_state.value} artifacts={r.artifact_dir}")
-            if r.classification is Classification.blocked_captcha:
+            if r.classification is Classification.blocked_captcha and s.stop_on_block:
                 print("CAPTCHA - stopping. Wait before trying again.")
                 break
             if r.classification is Classification.ok and r.artifact_dir:

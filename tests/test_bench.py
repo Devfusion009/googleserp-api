@@ -122,3 +122,18 @@ def test_run_stops_at_first_captcha(monkeypatch, tmp_path):
     assert len(seen) == 2  # nothing sent after the CAPTCHA
     reports = list(tmp_path.glob("*/report.md"))
     assert reports and "Run stopped early" in reports[0].read_text()
+
+
+def test_run_continues_past_captcha_when_stop_on_block_false(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_bench, "REPORTS", tmp_path)
+    monkeypatch.setattr(run_bench, "get_settings", lambda: Settings(_env_file=None, stop_on_block=False))
+    seen = []
+
+    async def fake_call_api(client, base_url, api_key, corpus, url):
+        seen.append(url)
+        return Call(corpus, url, 429, "blocked_captcha", 100, "absent", None, {}), {}
+
+    monkeypatch.setattr(run_bench, "call_api", fake_call_api)
+    args = run_bench.parse_args(["--corpus", "mixed", "--limit", "3", "--min-delay", "0"])
+    assert asyncio.run(run_bench.run(args)) == 0
+    assert len(seen) == 3

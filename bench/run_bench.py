@@ -7,7 +7,8 @@ Usage:
 
 Every request is a live Google page load through the API, so this refuses to
 plan more than MAX_LIVE_REQUESTS_PER_RUN calls unless --allow-more is passed,
-waits --min-delay seconds between calls, and stops at the first blocked_captcha.
+waits --min-delay seconds between calls, and stops at the first blocked_captcha
+(unless STOP_ON_BLOCK=false, e.g. with a rotating proxy list).
 
 Latency is client-side wall-clock time per HTTP call, over ALL requests
 (failures included), percentiles by the nearest-rank method.
@@ -255,7 +256,7 @@ async def run(args: argparse.Namespace) -> int:
                                         "classification": call.classification, "headers_timings": call.timings,
                                         "artifact_dir": call.artifact_dir, "response": data}) + "\n")
                 print(f"[{len(calls)}/{len(jobs)}] {corpus:9s} {call.classification:16s} {call.wall_ms:6d} ms  aio={call.aio_state}  {url}")
-                if call.classification == "blocked_captcha" and not stop.is_set():
+                if call.classification == "blocked_captcha" and settings.stop_on_block and not stop.is_set():
                     stopped_reason = "Google returned a CAPTCHA (blocked_captcha). Wait at least an hour before trying again from this IP."
                     stop.set()
 

@@ -238,6 +238,13 @@ async def serp(
         except Exception:
             log.exception("request_id=%s page=%d parse_error", request_id, page_idx + 1)
             return _error_response(request_id, "parse_error", "failed to parse the page", 502, elapsed(), requests_used, result)
+        if not page_result.organic:
+            # The brief counts a results page with no organic results as degraded,
+            # even when the results container itself was present.
+            log.warning("request_id=%s page=%d degraded_page: zero organic results", request_id, page_idx + 1)
+            return _error_response(
+                request_id, "degraded_page", "page loaded but had zero organic results", 502, elapsed(), requests_used, result
+            )
         pages.append(page_result)
 
     for w in all_warnings:
