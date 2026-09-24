@@ -17,12 +17,14 @@ from app.models import (  # noqa: E402
     AioSection,
     AioSource,
     AiOverview,
+    KnowledgePanel,
     OrganicItem,
     PageResult,
     SubLink,
 )
 from app.parsers.ads import parse_ads  # noqa: E402
 from app.parsers.aio import parse_aio  # noqa: E402
+from app.parsers.knowledge_panel import parse_knowledge_panel  # noqa: E402
 from app.parsers.misc import parse_corrections, parse_number_of_results, parse_suggestions  # noqa: E402
 from app.parsers.organic import parse_organic_results  # noqa: E402
 
@@ -53,12 +55,19 @@ def parse_fixture(slug: str) -> tuple[PageResult, list[str]]:
                 sources=[AioSource(title=s.title, url=s.url, snippet=s.snippet) for s in parsed.sources],
             )
 
+    kp = parse_knowledge_panel(tree)
+    knowledge_panel = (
+        KnowledgePanel(title=kp.title, subtitle=kp.subtitle, description=kp.description, source_url=kp.source_url, facts=kp.facts)
+        if kp is not None
+        else None
+    )
+
     page = PageResult(
         page=1,
         paid=paid,
         organic=organic,
         ai_overview=ai_overview,
-        knowledge_panel=None,  # not built yet - see PROGRESS.md
+        knowledge_panel=knowledge_panel,
         number_of_results=parse_number_of_results(tree),
         suggestions=parse_suggestions(tree),
         corrections=parse_corrections(tree),

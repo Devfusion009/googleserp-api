@@ -123,3 +123,18 @@ No live requests. Built and tested against the 16 real fixtures from Phase 2.
 ### Open questions for the client (collect for the README "assumptions" section)
 - Is the reconstructed-from-breadcrumb URL (used only when Google's own `/goto` redirect can't be decoded) acceptable, given it's occasionally just the site root instead of the deep link?
 - Is a slightly noisier `content` field acceptable for video-type organic results, or should those be cleaned up before Phase 4?
+
+## Phase 3 — Parsers — DONE
+
+### Added since last update
+- `app/parsers/knowledge_panel.py`: title/subtitle from a repeated `div.WcZOu` header stack, description + source_url from `[data-attrid="description"] .kno-rdesc` (the attribution link's href, real and direct), facts from every `[data-attrid^="kc:/"]` that has a `.w8qArf` label. **Verified against exactly one real fixture** (`eiffel_tower.html`) - it's the only one of the 16 with a traditional entity panel; `apple.html`/`t_mobile.html` have an empty `#rhs` placeholder (their "About X" box is a different, AI-generated element next to the AI Overview, out of scope for this field) - correctly returns `null` there. Treat these hooks as provisional until a second real KP page confirms them.
+- `tests/test_parsers.py`: 43 new tests (69 total) against the real fixtures - every fixture has non-empty organic, DNS/Wikipedia first-result title+url exact match, every AIO-present fixture has intro/sections/sources (or a documented empty-sources exception, see below), every no-AIO fixture has none, ads present/absent as expected, knowledge panel exact match on eiffel_tower and null on the placeholder pages, suggestions correctly skip the knowledge panel's own "People also search for" carousel.
+- `scripts/demo_parse.py` now fills in `knowledge_panel` too.
+
+### New real limitation found by the tests (not previously known)
+Google's opaque `/goto?url=<token>` link wrapper (documented for organic results) also appears on **AI Overview source cards** on 4 of the 11 AIO fixtures (apple, mobile, t_mobile, best_cell_phone_plans) - and unlike organic results, these source cards have **no visible cite/breadcrumb text to fall back to** (just a publisher name like "YouTube · Some Channel"). Per the no-reverse-engineering rule, we can't decode the token, so `ai_overview.sources` is correctly empty on those 4 pages even though the AI Overview clearly shows source cards on screen. `intro`/`sections` are unaffected (they don't depend on that link). Flagging this for the client - it's a real gap, not a bug we're hiding.
+
+### All parsers now covered
+organic, ads, ai_overview (intro/sections/sources), knowledge_panel, number_of_results, suggestions, corrections (still unverified - no fixture triggers it). 69/69 tests pass.
+
+### Next: Phase 4 (FastAPI app + full test suite for the API layer)
