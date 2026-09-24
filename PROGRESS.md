@@ -138,3 +138,44 @@ Google's opaque `/goto?url=<token>` link wrapper (documented for organic results
 organic, ads, ai_overview (intro/sections/sources), knowledge_panel, number_of_results, suggestions, corrections (still unverified - no fixture triggers it). 69/69 tests pass.
 
 ### Next: Phase 4 (FastAPI app + full test suite for the API layer)
+
+## Phase 4 — FastAPI app + tests — DONE
+
+No live requests. Smoke-tested the real server startup/shutdown (real Playwright
+browser launches and closes cleanly) and one invalid-url request through it -
+no request reached Google.
+
+### Done
+- `app/main.py`: `POST /serp`, `GET /health` (no API key needed). Validates the
+  URL first (400 `invalid_url`, no fetch attempted). Pages: `ceil(results/10)`,
+  page 1 untouched, `&start=10*n` after - built via `urls.page_url` (Phase 2).
+  Any page that doesn't come back `ok` stops pagination immediately and returns
+  that page's error with `results: []` (a later page failing discards earlier
+  successful ones, per the "results:[] on error" contract). `requests_used`
+  sums `timings["attempt"]` (retries included) across every page fetched.
+  `return_json: false` returns page 1's raw HTML as `text/html`. Debug headers
+  (`X-Request-Id`, `X-Classification`, `X-AIO-State`, `X-Timings`) set on every
+  response, success or error. `X-API-Key` enforced only when `API_KEY` is set.
+  A malformed body (missing `url`, wrong types) gets the client's own error
+  envelope at 400, not FastAPI's default 422 shape.
+- Testability: `get_fetcher`/`get_app_settings` are FastAPI dependencies, not
+  direct `app.state` reads, so tests override them and never touch
+  `app.state.browsers` - no real Playwright browser is ever launched by the
+  test suite.
+- `tests/test_api.py`: 17 tests, fetcher mocked with a `FakeFetcher` - success
+  shape, the difficult URL reaching the fetcher byte-for-byte, multi-page
+  pagination (`results=15` -> 2 fetcher calls, second with `&start=10`),
+  invalid URL rejected pre-fetch, malformed body -> 400 not 422, every failure
+  classification -> correct HTTP status + error code + empty `results`, a
+  second-page failure discarding the first page, `return_json: false`, API key
+  required/not-required, debug headers present.
+- All 86 tests pass (26 Phase 2 + 43 Phase 3 + 17 Phase 4).
+
+### Open question for the client
+- On a >10-results request where an early page succeeds but a later page fails
+  (e.g. gets CAPTCHA'd), we currently discard the successful early page(s) and
+  report the failure with `results: []`, since the contract says `results: []`
+  on any error. An alternative would be returning the successful pages with a
+  partial-failure flag. Confirm which the client's benchmark expects.
+
+### Next: Phase 5 (local benchmark, max 20 live requests: 15 mixed + 5 difficult)
