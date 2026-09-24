@@ -156,7 +156,19 @@ def _build_page_result(page_num: int, tree: HTMLParser, warnings: list[str]) -> 
     )
 
 
-def _error_response(request_id: str, code: str, message: str, status_code: int, elapsed_ms: int, requests_used: int) -> JSONResponse:
+def _set_debug_headers(resp, request_id: str, classification: str, result=None) -> None:
+    resp.headers["X-Request-Id"] = request_id
+    resp.headers["X-Classification"] = classification
+    if result is not None:
+        resp.headers["X-AIO-State"] = result.aio_state.value
+        resp.headers["X-Timings"] = json.dumps(result.timings)
+        if result.artifact_dir:
+            resp.headers["X-Artifact-Dir"] = result.artifact_dir
+
+
+def _error_response(
+    request_id: str, code: str, message: str, status_code: int, elapsed_ms: int, requests_used: int, result=None
+) -> JSONResponse:
     body = SerpResponse(
         status_code=status_code,
         requests_used=requests_used,
@@ -166,8 +178,7 @@ def _error_response(request_id: str, code: str, message: str, status_code: int, 
         error_message=message,
     )
     resp = JSONResponse(status_code=status_code, content=body.model_dump())
-    resp.headers["X-Request-Id"] = request_id
-    resp.headers["X-Classification"] = code
+    _set_debug_headers(resp, request_id, code, result)
     return resp
 
 
@@ -179,62 +190,48 @@ async def serp(
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
 
+    def elapsed() -> int:
+        return int((time.perf_counter() - t0) * 1000)
+
     try:
         validate_search_url(req.url)
     except InvalidUrl as e:
-        return _error_response(request_id, "invalid_url", str(e), 400, int((time.perf_counter() - t0) * 1000), 0)
+        return _error_response(request_id, "invalid_url", str(e), 400, elapsed(), 0)
 
     num_pages = max(1, math.ceil(req.results / RESULTS_PER_PAGE))
     requests_used = 0
     pages: list[PageResult] = []
-    first_page_html: str | None = None
+    first = None
     all_warnings: list[str] = []
-    timings_header: dict = {}
-    aio_state_header = "absent"
 
     for page_idx in range(num_pages):
         url = page_url(req.url, page_idx)
         result = await fetcher.fetch(url, req.country, req.language)
         requests_used += result.timings.get("attempt", 1)
-
         if page_idx == 0:
-            first_page_html = result.html
-            timings_header = result.timings
-            aio_state_header = result.aio_state.value
+            first = result
 
         if result.classification is not Classification.ok:
             code = ERROR_CODE_FOR.get(result.classification, "network_error")
             status_code = STATUS_FOR.get(result.classification, 502)
             log.warning("request_id=%s page=%d classification=%s reason=%s", request_id, page_idx + 1, code, result.reason)
-            return _error_response(request_id, code, result.reason, status_code, int((time.perf_counter() - t0) * 1000), requests_used)
+            return _error_response(request_id, code, result.reason, status_code, elapsed(), requests_used, result)
 
         try:
             tree = HTMLParser(result.html or "")
             page_result = _build_page_result(page_idx + 1, tree, all_warnings)
         except Exception:
             log.exception("request_id=%s page=%d parse_error", request_id, page_idx + 1)
-            return _error_response(
-                request_id, "parse_error", "failed to parse the page", 502, int((time.perf_counter() - t0) * 1000), requests_used
-            )
+            return _error_response(request_id, "parse_error", "failed to parse the page", 502, elapsed(), requests_used, result)
         pages.append(page_result)
 
     for w in all_warnings:
         log.warning("request_id=%s parse warning: %s", request_id, w)
 
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-
     if not req.return_json:
-        resp = HTMLResponse(content=first_page_html or "")
-        resp.headers["X-Request-Id"] = request_id
-        resp.headers["X-Classification"] = "ok"
-        resp.headers["X-AIO-State"] = aio_state_header
-        resp.headers["X-Timings"] = json.dumps(timings_header)
-        return resp
-
-    body = SerpResponse(status_code=200, requests_used=requests_used, elapsed_time=elapsed_ms, results=pages, error=None, error_message=None)
-    resp = JSONResponse(content=body.model_dump())
-    resp.headers["X-Request-Id"] = request_id
-    resp.headers["X-Classification"] = "ok"
-    resp.headers["X-AIO-State"] = aio_state_header
-    resp.headers["X-Timings"] = json.dumps(timings_header)
+        resp = HTMLResponse(content=first.html or "")
+    else:
+        body = SerpResponse(status_code=200, requests_used=requests_used, elapsed_time=elapsed(), results=pages)
+        resp = JSONResponse(content=body.model_dump())
+    _set_debug_headers(resp, request_id, "ok", first)
     return resp
