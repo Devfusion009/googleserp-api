@@ -14,7 +14,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
-from .browser import BrowserManager
+from .browser import PagePool
 from .classify import AioState, Classification, classify_page
 from .config import Settings
 
@@ -66,7 +66,7 @@ def _slug(url: str) -> str:
 
 
 class Fetcher:
-    def __init__(self, settings: Settings, browsers: BrowserManager):
+    def __init__(self, settings: Settings, browsers: PagePool):
         self.s = settings
         self.browsers = browsers
 

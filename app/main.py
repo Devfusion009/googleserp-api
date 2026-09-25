@@ -7,7 +7,6 @@ exact JSON shape, and report an honest error the moment any page fails.
 """
 import json
 import logging
-import math
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -15,30 +14,13 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
-from selectolax.parser import HTMLParser
 
 from .browser import BrowserManager
-from .classify import STATUS_FOR, Classification
-from .classify import find_aio_root
 from .config import Settings, get_settings
 from .fetcher import Fetcher
-from .models import (
-    AioSection,
-    AioSource,
-    AiOverview,
-    KnowledgePanel,
-    OrganicItem,
-    PageResult,
-    SerpRequest,
-    SerpResponse,
-    SubLink,
-)
-from .parsers.ads import parse_ads
-from .parsers.aio import parse_aio
-from .parsers.knowledge_panel import parse_knowledge_panel
-from .parsers.misc import parse_corrections, parse_number_of_results, parse_suggestions
-from .parsers.organic import parse_organic_results
-from .urls import InvalidUrl, page_url, validate_search_url
+from .models import SerpRequest, SerpResponse
+from .orchestrator import run_serp
+from .urls import InvalidUrl, validate_search_url
 
 log = logging.getLogger("serp.api")
 
@@ -56,20 +38,6 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
-
-RESULTS_PER_PAGE = 10
-
-# error code -> (classification match, http status) used to build the response
-ERROR_CODE_FOR = {
-    Classification.blocked_captcha: "blocked_captcha",
-    Classification.consent_wall: "consent_wall",
-    Classification.degraded_page: "degraded_page",
-    Classification.aio_incomplete: "aio_incomplete",
-    Classification.parse_error: "parse_error",
-    Classification.timeout: "timeout",
-    Classification.network_error: "network_error",
-    Classification.invalid_url: "invalid_url",
-}
 
 
 @asynccontextmanager
@@ -124,53 +92,6 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-def _build_page_result(page_num: int, tree: HTMLParser, warnings: list[str]) -> PageResult:
-    organic_raw, w = parse_organic_results(tree.css_first("#rso") or tree)
-    warnings.extend(w)
-    organic = [
-        OrganicItem(url=o.url, title=o.title, content=o.content, sub_links=[SubLink(title=s.title, url=s.url) for s in o.sub_links])
-        for o in organic_raw
-    ]
-
-    ad_warnings: list[str] = []
-    paid_raw = parse_ads(tree.css_first("#tads"), ad_warnings) + parse_ads(tree.css_first("#bottomads"), ad_warnings)
-    warnings.extend(ad_warnings)
-    paid = [
-        OrganicItem(url=a.url, title=a.title, content=a.content, sub_links=[SubLink(title=s.title, url=s.url) for s in a.sub_links])
-        for a in paid_raw
-    ]
-
-    ai_overview = None
-    aio_root = find_aio_root(tree)
-    if aio_root is not None:
-        parsed = parse_aio(aio_root)
-        warnings.extend(parsed.warnings)
-        if parsed.intro or parsed.sections or parsed.sources:
-            ai_overview = AiOverview(
-                intro=parsed.intro,
-                sections=[AioSection(title=s.title, text=s.text) for s in parsed.sections],
-                sources=[AioSource(title=s.title, url=s.url, snippet=s.snippet) for s in parsed.sources],
-            )
-
-    kp = parse_knowledge_panel(tree)
-    knowledge_panel = (
-        KnowledgePanel(title=kp.title, subtitle=kp.subtitle, description=kp.description, source_url=kp.source_url, facts=kp.facts)
-        if kp is not None
-        else None
-    )
-
-    return PageResult(
-        page=page_num,
-        paid=paid,
-        organic=organic,
-        ai_overview=ai_overview,
-        knowledge_panel=knowledge_panel,
-        number_of_results=parse_number_of_results(tree),
-        suggestions=parse_suggestions(tree),
-        corrections=parse_corrections(tree),
-    )
-
-
 def _set_debug_headers(resp, request_id: str, classification: str, result=None) -> None:
     resp.headers["X-Request-Id"] = request_id
     resp.headers["X-Classification"] = classification
@@ -201,6 +122,7 @@ def _error_response(
 async def serp(
     req: SerpRequest,
     fetcher: Fetcher = Depends(get_fetcher),
+    settings: Settings = Depends(get_app_settings),
 ):
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
@@ -213,47 +135,19 @@ async def serp(
     except InvalidUrl as e:
         return _error_response(request_id, "invalid_url", str(e), 400, elapsed(), 0)
 
-    num_pages = max(1, math.ceil(req.results / RESULTS_PER_PAGE))
-    requests_used = 0
-    pages: list[PageResult] = []
-    first = None
-    all_warnings: list[str] = []
+    outcome = await run_serp(req, fetcher, settings)
 
-    for page_idx in range(num_pages):
-        url = page_url(req.url, page_idx)
-        result = await fetcher.fetch(url, req.country, req.language)
-        requests_used += result.timings.get("attempt", 1)
-        if page_idx == 0:
-            first = result
+    if not outcome.ok:
+        log.warning("request_id=%s page=%s classification=%s reason=%s", request_id, outcome.failed_page, outcome.error_code, outcome.error_message)
+        return _error_response(request_id, outcome.error_code, outcome.error_message, outcome.status_code, elapsed(), outcome.requests_used, outcome.first)
 
-        if result.classification is not Classification.ok:
-            code = ERROR_CODE_FOR.get(result.classification, "network_error")
-            status_code = STATUS_FOR.get(result.classification, 502)
-            log.warning("request_id=%s page=%d classification=%s reason=%s", request_id, page_idx + 1, code, result.reason)
-            return _error_response(request_id, code, result.reason, status_code, elapsed(), requests_used, result)
-
-        try:
-            tree = HTMLParser(result.html or "")
-            page_result = _build_page_result(page_idx + 1, tree, all_warnings)
-        except Exception:
-            log.exception("request_id=%s page=%d parse_error", request_id, page_idx + 1)
-            return _error_response(request_id, "parse_error", "failed to parse the page", 502, elapsed(), requests_used, result)
-        if not page_result.organic:
-            # The brief counts a results page with no organic results as degraded,
-            # even when the results container itself was present.
-            log.warning("request_id=%s page=%d degraded_page: zero organic results", request_id, page_idx + 1)
-            return _error_response(
-                request_id, "degraded_page", "page loaded but had zero organic results", 502, elapsed(), requests_used, result
-            )
-        pages.append(page_result)
-
-    for w in all_warnings:
+    for w in outcome.warnings:
         log.warning("request_id=%s parse warning: %s", request_id, w)
 
     if not req.return_json:
-        resp = HTMLResponse(content=first.html or "")
+        resp = HTMLResponse(content=outcome.first.html or "")
     else:
-        body = SerpResponse(status_code=200, requests_used=requests_used, elapsed_time=elapsed(), results=pages)
+        body = SerpResponse(status_code=200, requests_used=outcome.requests_used, elapsed_time=elapsed(), results=outcome.pages)
         resp = JSONResponse(content=body.model_dump())
-    _set_debug_headers(resp, request_id, "ok", first)
+    _set_debug_headers(resp, request_id, "ok", outcome.first)
     return resp

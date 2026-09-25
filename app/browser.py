@@ -7,6 +7,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import AsyncContextManager, Protocol
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 
@@ -15,8 +16,21 @@ from .proxy import ProxyProvider, make_provider, mask_proxy, to_playwright
 
 log = logging.getLogger("serp.browser")
 
-BLOCKED_TYPES = {"image", "media", "font"}
-VIEWPORT = {"width": 1366, "height": 768}
+
+class PageSlot(Protocol):
+    """What Fetcher needs from a checked-out slot: a live Playwright Page and
+    the proxy URL it's using (for logging)."""
+
+    page: Page
+    proxy: str | None
+
+
+class PagePool(Protocol):
+    """What Fetcher needs from its browser pool - checking a slot in and out.
+    BrowserManager satisfies this structurally; so does a test double (see
+    tests/test_fetcher_passthrough.py)."""
+
+    def page(self, country: str | None = None, language: str | None = None) -> AsyncContextManager[PageSlot]: ...
 
 
 @dataclass
@@ -65,7 +79,8 @@ class BrowserManager:
             await self._pw.stop()
 
     async def _block(self, route: Route) -> None:
-        if route.request.resource_type in BLOCKED_TYPES:
+        blocked = set(self.s.blocked_resource_types.split(","))
+        if route.request.resource_type in blocked:
             await route.abort()
         else:
             await route.continue_()
@@ -78,8 +93,9 @@ class BrowserManager:
             slot.context = slot.page = None
         if slot.context is None:
             assert self.browser is not None
+            viewport = {"width": self.s.viewport_width, "height": self.s.viewport_height}
             opts = dict(
-                viewport=VIEWPORT, locale=locale,
+                viewport=viewport, locale=locale,
                 extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"},
             )
             if proxy:

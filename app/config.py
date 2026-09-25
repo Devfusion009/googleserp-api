@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     browser_channel: Literal["chromium", "chrome"] = "chromium"
     concurrency: int = 1
     block_resources: bool = True
+    blocked_resource_types: str = "image,media,font"
+    viewport_width: int = 1366
+    viewport_height: int = 768
+    results_per_page: int = 10
     nav_timeout_ms: int = 15000
     aio_appear_wait_ms: int = 1500
     aio_max_wait_ms: int = 8000

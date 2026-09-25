@@ -2,6 +2,7 @@
 import itertools
 import threading
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 from .config import Settings
@@ -66,9 +67,12 @@ class ListProxy(ProxyProvider):
         return url.replace("{country}", (country or "us").lower())
 
 
+PROXY_PROVIDERS: dict[str, Callable[[Settings], ProxyProvider]] = {
+    "none": lambda s: NoProxy(),
+    "static": lambda s: StaticProxy(s.proxy_url),
+    "list": lambda s: ListProxy(s.proxy_list_file),
+}
+
+
 def make_provider(s: Settings) -> ProxyProvider:
-    if s.proxy_mode == "static":
-        return StaticProxy(s.proxy_url)
-    if s.proxy_mode == "list":
-        return ListProxy(s.proxy_list_file)
-    return NoProxy()
+    return PROXY_PROVIDERS[s.proxy_mode](s)
