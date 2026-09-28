@@ -121,7 +121,46 @@ def test_run_stops_at_first_captcha(monkeypatch, tmp_path):
     assert rc == 0
     assert len(seen) == 2  # nothing sent after the CAPTCHA
     reports = list(tmp_path.glob("*/report.md"))
-    assert reports and "Run stopped early" in reports[0].read_text()
+    text = reports[0].read_text()
+    assert "Run stopped early" in text and "don't establish benchmark success rates" in text
+    assert "**blocked_captcha** x1" in text  # the stopping request is in the results
+    assert "### Not executed (13)" in text  # 15 planned, 2 ran
+    assert all(f"`{u}`" in text.split("### Not executed")[1] for _, u in run_bench.plan("mixed", 1, None)[2:])
+
+
+def test_run_stops_before_the_traffic_budget(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_bench, "REPORTS", tmp_path)
+    seen = []
+
+    async def fake_call_api(client, base_url, api_key, corpus, url):
+        seen.append(url)
+        return Call(corpus, url, 200, "ok", 100, "absent", None, {"bytes_in": 20 * 1024 * 1024}), {}
+
+    monkeypatch.setattr(run_bench, "call_api", fake_call_api)
+    args = run_bench.parse_args(["--corpus", "mixed", "--min-delay", "0", "--traffic-budget-mb", "100"])
+    assert asyncio.run(run_bench.run(args)) == 0
+    # 20 MB pages against 70% of 100 MB: a 4th page could reach 80 MB, so 3 run.
+    assert len(seen) == 3
+    text = next(tmp_path.glob("*/report.md")).read_text()
+    assert "traffic budget" in text and "### Not executed (12)" in text
+
+
+def test_call_api_reads_google_request_usage():
+    url = "https://www.google.com/search?q=x&gl=us&hl=en"
+    r = ok_result(url)
+    r.usage = {"document": 1, "async": 2, "goto": 9, "other_google": 30}
+    r.session = {"session": "ab12cd34", "exit_ip": "203.0.113.7", "exit_ip_after": "203.0.113.7"}
+
+    async def go():
+        async with _asgi_client(FakeFetcher([r])) as client:
+            return await call_api(client, "http://test", None, "mixed", url)
+
+    call, data = asyncio.run(go())
+    assert call.requests_used == data["requests_used"] == 12  # page + 2 async + 9 /goto; scripts excluded
+    assert call.google_requests == {"requests_used": 12, "document": 1, "async": 2, "goto": 9, "other_google": 30}
+    assert call.session["session"] == "ab12cd34"
+    s = summarize([call])
+    assert s["usage"]["requests_used"] == 12 and s["usage"]["sessions"] == 1 and s["usage"]["exit_ips"] == 1
 
 
 def test_run_continues_past_captcha_when_stop_on_block_false(monkeypatch, tmp_path):

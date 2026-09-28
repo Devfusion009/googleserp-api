@@ -30,9 +30,13 @@ class Settings(BaseSettings):
     min_delay_seconds: float = 10
     stop_on_block: bool = True
     max_live_requests_per_run: int = 30
+    traffic_budget_mb: float = 0  # benchmark stops before exceeding this (0 = no budget)
     proxy_mode: Literal["none", "static", "list"] = "none"
     proxy_url: str = ""
     proxy_list_file: str = ""
+    proxy_session_max_seconds: int = 0
+    exit_ip_check_url: str = ""
+    exit_ip_check_timeout_ms: int = 5000
     debug_artifacts: bool = True
     artifacts_dir: str = "artifacts"
 

@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +86,20 @@ class FetchResult:
     artifact_dir: str | None = None
     proxy: str | None = None
     links: dict[str, str] = field(default_factory=dict)  # /goto token -> destination
+    # Requests by kind (netwatch.REQUEST_KINDS, plus goto_fallback), summed over retries.
+    usage: dict[str, int] = field(default_factory=dict)
+    # Proxy session facts for this request: session id, exit_ip, exit_ip_after, ip_changed.
+    session: dict = field(default_factory=dict)
+
+    @property
+    def requests_used(self) -> int:
+        """Requests to Google this fetch cost: page loads (every attempt and
+        redirect hop, so retries count), /async/ follow-ups (the AI Overview) and
+        /goto link resolutions. Scripts, styles and logging pings are in `usage`
+        but not counted here."""
+        attempts = self.timings.get("attempt", 1)
+        u = self.usage
+        return max(u.get("document", 0), attempts) + u.get("async", 0) + u.get("goto", 0) + u.get("goto_fallback", 0)
 
 
 def _ms(t0: float) -> int:
@@ -104,12 +119,24 @@ class Fetcher:
     async def fetch(self, url: str, country: str | None, language: str | None) -> FetchResult:
         attempts = 1 + max(0, self.s.max_retries)
         result = None
+        usage: Counter = Counter()
+        bytes_in = 0
+        ip_changed = False
         for attempt in range(attempts):
             result = await self._fetch_once(url, country, language)
+            usage.update(result.usage)
+            bytes_in += result.timings.get("bytes_in", 0)
+            ip_changed = ip_changed or bool(result.session.get("ip_changed"))
             result.timings["attempt"] = attempt + 1
             if result.classification not in (Classification.timeout, Classification.network_error):
                 break
             log.warning("retryable failure %s (attempt %d/%d)", result.classification.value, attempt + 1, attempts)
+        # A retry costs requests and traffic too: report the totals, not the last attempt's.
+        result.usage = dict(usage)
+        if "bytes_in" in result.timings:
+            result.timings["bytes_in"] = bytes_in
+        if ip_changed:
+            result.session["ip_changed"] = True
         return result
 
     async def _fetch_once(self, url: str, country: str | None, language: str | None) -> FetchResult:
@@ -118,6 +145,8 @@ class Fetcher:
         try:
             async with self.browsers.page(country, language) as slot:
                 res.proxy = slot.proxy
+                # The pool fills in the exit IP after the request (same dict).
+                res.session = getattr(slot, "report", None) or {}
                 net = getattr(slot, "net", None)
                 if net is not None:
                     net.reset()
@@ -126,6 +155,11 @@ class Fetcher:
                 finally:
                     if net is not None:
                         res.timings["bytes_in"], res.timings["net_requests"] = net.bytes, net.requests
+                        res.usage.update({k: v for k, v in net.kinds.items() if v})
+                    else:
+                        res.usage.setdefault("document", 1)
+                if res.classification in (Classification.blocked_captcha, Classification.consent_wall) and hasattr(slot, "retire"):
+                    slot.retire = f"Google answered {res.classification.value} on this session"
         except (asyncio.TimeoutError, PlaywrightTimeout) as e:
             res.classification, res.reason = Classification.timeout, f"timed out: {str(e)[:200] or 'request deadline'}"
         except PlaywrightError as e:
@@ -187,6 +221,8 @@ class Fetcher:
         res.timings["links_resolved"] = len(outcome.resolved)
         res.timings["links_in_page"] = outcome.in_page
         res.timings["links_ms"] = _ms(t0)
+        if outcome.fallback_requests:
+            res.usage["goto_fallback"] = outcome.fallback_requests
         if outcome.blocked:
             res.classification = Classification.blocked_captcha
             res.reason = "Google answered a /goto link with its /sorry/ (unusual traffic) page"

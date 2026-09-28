@@ -5,6 +5,7 @@ Response. main.py turns the outcome into JSON/headers/log lines.
 """
 import logging
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 
 from selectolax.parser import HTMLParser
@@ -64,6 +65,7 @@ class SerpOutcome:
     pages: list[PageResult] = field(default_factory=list)
     first: FetchResult | None = None
     requests_used: int = 0
+    usage: dict[str, int] = field(default_factory=dict)  # requests by kind, all pages
     warnings: list[str] = field(default_factory=list)
     failed_page: int | None = None
     error_code: str | None = None
@@ -77,21 +79,25 @@ async def run_serp(req: SerpRequest, fetcher: Fetcher, settings: Settings) -> Se
     pages: list[PageResult] = []
     first: FetchResult | None = None
     all_warnings: list[str] = []
+    usage: Counter = Counter()
 
     for page_idx in range(num_pages):
         url = page_url(req.url, page_idx)
         result = await fetcher.fetch(url, req.country, req.language)
-        requests_used += result.timings.get("attempt", 1)
+        requests_used += result.requests_used
+        usage.update(result.usage)
         if page_idx == 0:
             first = result
 
+        def fail(code: str, message: str, status_code: int) -> SerpOutcome:
+            return SerpOutcome(
+                ok=False, first=first, requests_used=requests_used, usage=dict(usage), failed_page=page_idx + 1,
+                error_code=code, error_message=message, status_code=status_code,
+            )
+
         if result.classification is not Classification.ok:
             code = ERROR_CODE_FOR.get(result.classification, "network_error")
-            status_code = STATUS_FOR.get(result.classification, 502)
-            return SerpOutcome(
-                ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
-                error_code=code, error_message=result.reason, status_code=status_code,
-            )
+            return fail(code, result.reason, STATUS_FOR.get(result.classification, 502))
 
         try:
             tree = HTMLParser(result.html or "")
@@ -100,26 +106,17 @@ async def run_serp(req: SerpRequest, fetcher: Fetcher, settings: Settings) -> Se
             all_warnings.extend(ctx.warnings)
         except Exception:
             log.exception("page=%d parse_error", page_idx + 1)
-            return SerpOutcome(
-                ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
-                error_code="parse_error", error_message="failed to parse the page", status_code=502,
-            )
+            return fail("parse_error", "failed to parse the page", 502)
         if not page_result.organic:
             # The brief counts a results page with no organic results as degraded,
             # even when the results container itself was present.
-            return SerpOutcome(
-                ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
-                error_code="degraded_page", error_message="page loaded but had zero organic results", status_code=502,
-            )
+            return fail("degraded_page", "page loaded but had zero organic results", 502)
         incomplete = completeness_error(ctx.gaps)
         if incomplete is not None:
             code, message = incomplete
             if code == "aio_incomplete":
                 result.aio_state = AioState.incomplete
-            return SerpOutcome(
-                ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
-                error_code=code, error_message=message, status_code=STATUS_FOR[Classification(code)],
-            )
+            return fail(code, message, STATUS_FOR[Classification(code)])
         pages.append(page_result)
 
-    return SerpOutcome(ok=True, pages=pages, first=first, requests_used=requests_used, warnings=all_warnings)
+    return SerpOutcome(ok=True, pages=pages, first=first, requests_used=requests_used, usage=dict(usage), warnings=all_warnings)

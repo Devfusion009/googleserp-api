@@ -117,7 +117,7 @@ async def test_direct_link_pages_are_valid_end_to_end(slug):
     if slug in HAS_AIO:
         aio = page.ai_overview
         assert aio is not None and aio.intro and aio.sections and aio.sources
-        assert all(src.url.startswith("http") and "google.com" not in src.url for src in aio.sources)
+        assert all(src.url.startswith("http") and "/goto?" not in src.url for src in aio.sources)
     else:
         assert page.ai_overview is None
 

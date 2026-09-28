@@ -1,10 +1,29 @@
 """Playwright lifecycle: one warm browser, a pool of CONCURRENCY page slots.
 
 Each slot owns a browser context (proxy + locale are per context) and one page.
-The context is rebuilt only when the proxy or locale must change.
+
+Proxy sessions and IP changes. A residential proxy's sticky session can end
+early and hand out a new exit IP. Google's cookies belong to the IP they were
+set on, so a browser context is tied to one proxy session and never carried
+to another:
+  - a literal `{session}` in the proxy URL is replaced with a fresh id each time
+    a context is built, so every context is its own sticky session;
+  - the context is rebuilt (new session) only between requests, never during
+    one: when the proxy or locale changes, after a CAPTCHA, when it is older
+    than PROXY_SESSION_MAX_SECONDS, or when the exit IP moved (see below);
+  - with EXIT_IP_CHECK_URL set, the exit IP is read through the slot's proxy
+    before and after each request. A change while idle -> fresh session before
+    the request; a change during a request is recorded against that request
+    (X-Proxy-Session, benchmark report) and the next request gets a fresh
+    session. The request itself is judged on what Google returned - a page
+    broken by the switch fails like any other, and is not retried.
 """
 import asyncio
+import ipaddress
 import logging
+import re
+import secrets
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncContextManager, Protocol
@@ -26,6 +45,8 @@ class PageSlot(Protocol):
     page: Page
     proxy: str | None
     net: NetworkWatch | None
+    retire: str | None  # set to a reason to get a fresh context/session next time
+    report: dict  # this request's proxy-session facts (session id, exit IPs)
 
 
 class PagePool(Protocol):
@@ -45,12 +66,31 @@ class Slot:
     locale: str | None = None
     net: NetworkWatch | None = None
     uses: int = field(default=0)
+    proxy_template: str | None = None  # proxy URL as configured, before {session}
+    session: str | None = None
+    created: float = 0.0
+    exit_ip: str | None = None
+    retire: str | None = None
+    report: dict = field(default_factory=dict)
 
 
 def locale_for(country: str | None, language: str | None) -> str:
     lang = (language or "en").split("-")[0].lower()
     cc = (country or "US").upper()
     return f"{lang}-{cc}"
+
+
+IP_CANDIDATE_RE = re.compile(r"[0-9A-Fa-f:.]{2,45}")
+
+
+def parse_ip(text: str) -> str | None:
+    """First valid IPv4/IPv6 address in an IP-check answer (plain text or JSON)."""
+    for candidate in IP_CANDIDATE_RE.findall(text or ""):
+        try:
+            return str(ipaddress.ip_address(candidate.strip(".")))
+        except ValueError:
+            continue
+    return None
 
 
 class BrowserManager:
@@ -91,29 +131,82 @@ class BrowserManager:
         else:
             await route.continue_()
 
+    async def exit_ip(self, slot: Slot) -> str | None:
+        """The slot's current exit IP via EXIT_IP_CHECK_URL (through its proxy), or
+        None when not configured or the check failed."""
+        if not self.s.exit_ip_check_url or slot.context is None:
+            return None
+        try:
+            resp = await slot.context.request.get(self.s.exit_ip_check_url, timeout=self.s.exit_ip_check_timeout_ms)
+            ip = parse_ip(await resp.text()) if resp.ok else None
+            await resp.dispose()
+        except Exception as e:  # a failed check is "unknown", never a reason to fail the request
+            log.warning("slot=%d exit IP check failed: %s", slot.index, str(e).splitlines()[0][:200])
+            return None
+        return ip
+
+    async def _close(self, slot: Slot, reason: str) -> None:
+        log.info("slot=%d new proxy session: %s", slot.index, reason)
+        if slot.context is not None:
+            try:
+                await slot.context.close()
+            except Exception:
+                pass
+        slot.context = slot.page = slot.net = None
+
+    async def _build(self, slot: Slot, template: str | None, locale: str) -> None:
+        assert self.browser is not None
+        slot.session = secrets.token_hex(4) if template and "{session}" in template else None
+        proxy = template.replace("{session}", slot.session) if template and slot.session else template
+        viewport = {"width": self.s.viewport_width, "height": self.s.viewport_height}
+        opts = dict(
+            viewport=viewport, locale=locale,
+            extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"},
+        )
+        if proxy:
+            opts["proxy"] = to_playwright(proxy)
+        slot.context = await self.browser.new_context(**opts)
+        if self.s.block_resources:
+            await slot.context.route("**/*", self._block)
+        slot.page = await slot.context.new_page()
+        slot.net = NetworkWatch()
+        await slot.net.attach(slot.context, slot.page)
+        slot.proxy_template, slot.proxy, slot.locale = template, proxy, locale
+        slot.created, slot.retire = time.monotonic(), None
+        slot.exit_ip = await self.exit_ip(slot)
+
+    def _rebuild_reason(self, slot: Slot, template: str | None, locale: str) -> str | None:
+        if slot.context is None:
+            return None
+        if template != slot.proxy_template or locale != slot.locale:
+            return "proxy or locale changed"
+        if slot.retire:
+            return slot.retire
+        max_age = self.s.proxy_session_max_seconds
+        if max_age and time.monotonic() - slot.created >= max_age:
+            return f"session older than PROXY_SESSION_MAX_SECONDS={max_age}"
+        return None
+
     async def _prepare(self, slot: Slot, country: str | None, language: str | None) -> None:
         locale = locale_for(country, language)
-        proxy = self.provider.next(country) if (self.provider.rotates or slot.context is None) else slot.proxy
-        if slot.context is not None and (proxy != slot.proxy or locale != slot.locale):
-            await slot.context.close()
-            slot.context = slot.page = slot.net = None
+        template = self.provider.next(country) if (self.provider.rotates or slot.context is None) else slot.proxy_template
+        reason = self._rebuild_reason(slot, template, locale)
+        if reason:
+            await self._close(slot, reason)
         if slot.context is None:
-            assert self.browser is not None
-            viewport = {"width": self.s.viewport_width, "height": self.s.viewport_height}
-            opts = dict(
-                viewport=viewport, locale=locale,
-                extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"},
-            )
-            if proxy:
-                opts["proxy"] = to_playwright(proxy)
-            slot.context = await self.browser.new_context(**opts)
-            if self.s.block_resources:
-                await slot.context.route("**/*", self._block)
-            slot.page = await slot.context.new_page()
-            slot.net = NetworkWatch()
-            await slot.net.attach(slot.context, slot.page)
-            slot.proxy, slot.locale = proxy, locale
-        log.info("slot=%d proxy=%s locale=%s", slot.index, mask_proxy(slot.proxy), slot.locale)
+            await self._build(slot, template, locale)
+        elif self.s.exit_ip_check_url:
+            ip = await self.exit_ip(slot)
+            if ip and slot.exit_ip and ip != slot.exit_ip:
+                # The session moved to another IP while idle: don't bring this
+                # IP's cookies to the new one.
+                await self._close(slot, f"exit IP changed between requests ({slot.exit_ip} -> {ip})")
+                await self._build(slot, template, locale)
+            elif ip:
+                slot.exit_ip = ip
+        slot.report = {"session": slot.session, "exit_ip": slot.exit_ip}
+        log.info("slot=%d proxy=%s session=%s exit_ip=%s locale=%s",
+                 slot.index, mask_proxy(slot.proxy), slot.session, slot.exit_ip, slot.locale)
 
     @asynccontextmanager
     async def page(self, country: str | None = None, language: str | None = None):
@@ -122,6 +215,14 @@ class BrowserManager:
             await self._prepare(slot, country, language)
             slot.uses += 1
             yield slot
+            if self.s.exit_ip_check_url:
+                after = await self.exit_ip(slot)
+                slot.report["exit_ip_after"] = after
+                if after and slot.exit_ip and after != slot.exit_ip:
+                    slot.report["ip_changed"] = True
+                    slot.retire = f"exit IP changed during a request ({slot.exit_ip} -> {after})"
+                    log.warning("slot=%d %s", slot.index, slot.retire)
+                slot.exit_ip = after or slot.exit_ip
         except Exception:
             # a broken page/context is rebuilt next time
             if slot.context:

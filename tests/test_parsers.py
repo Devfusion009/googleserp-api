@@ -136,7 +136,41 @@ def test_aio_present_fixtures_have_intro_and_sections(slug):
     assert result.sources, f"{slug}: AI Overview has no sources"
     for src in result.sources:
         assert src.url.startswith("http"), f"{slug}: a source url is not absolute: {src.url!r}"
-        assert "google.com" not in src.url, f"{slug}: a source url points at google.com"
+        assert "/url?" not in src.url and "/goto?" not in src.url, f"{slug}: a redirect wrapper was not resolved: {src.url!r}"
+
+
+def test_google_hosted_citation_is_kept():
+    # The flights AI Overview cites Google Flights; it is a genuine source.
+    tree = tree_for("difficult_flights_to_brussels_from_shanghai")
+    ctx = ParseContext()
+    sources = parse_aio(find_aio_root(tree), ctx).sources
+    assert any(s.url.startswith("https://www.google.com/travel/flights") for s in sources)
+    assert len(sources) == 5 and not ctx.gaps
+
+
+def test_product_cards_are_the_only_cards_left_out():
+    # apple and best_cell_phone_plans have shopping cards (no href, role=button,
+    # data-cid). They are skipped; every other card is either a source or a gap.
+    for slug, products in (("apple", 1), ("best_cell_phone_plans", 2)):
+        root = find_aio_root(tree_for(slug))
+        cards = root.css("li.h7wxwc")
+        ctx = ParseContext()
+        parse_aio(root, ctx)
+        skipped = [w for w in ctx.warnings if "shopping element" in w]
+        source_gaps = [g for g in ctx.gaps if g.reason.startswith("source card")]
+        assert len(skipped) == products
+        assert len(source_gaps) == len(cards) - products  # offline: every other card is an unresolved /goto
+
+
+def test_a_linkless_card_that_is_not_a_product_is_a_gap():
+    tree = tree_for("apple")
+    root = find_aio_root(tree)
+    card_link = next(a for a in root.css("li.h7wxwc a.vIWmYe") if a.attributes.get("data-cid"))
+    del card_link.attrs["data-cid"]  # no longer recognisably a shopping card
+    ctx = ParseContext()
+    parse_aio(root, ctx)
+    assert not any("shopping element" in w for w in ctx.warnings)
+    assert any("no usable link" in g.reason for g in ctx.gaps)
 
 
 @pytest.mark.parametrize("slug", sorted(NO_AIO))
