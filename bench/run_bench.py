@@ -39,7 +39,8 @@ LOCAL_LABEL = (
     "Local run from India without proxies. Latency and block rate are NOT "
     "representative of the client's US-proxy test."
 )
-STAGES = ("nav_ms", "results_ms", "aio_ms", "total_ms")
+PROXY_LABEL = "Run through proxies (PROXY_MODE={mode})."
+STAGES = ("nav_ms", "results_ms", "aio_ms", "links_ms", "total_ms")
 
 
 @dataclass
@@ -143,6 +144,24 @@ def summarize(calls: list[Call]) -> dict:
         vals = [c.timings[stage] for c in calls if isinstance(c.timings.get(stage), (int, float))]
         stage_avgs[stage] = round(sum(vals) / len(vals)) if vals else None
 
+    def per_page(key: str) -> list[int]:
+        return [c.timings[key] for c in calls if isinstance(c.timings.get(key), (int, float))]
+
+    def avg(vals: list, digits: int = 0):
+        return round(sum(vals) / len(vals), digits or None) if vals else None
+
+    kb_in = [b / 1024 for b in per_page("bytes_in")]
+    needed, resolved = per_page("links_needed"), per_page("links_resolved")
+    traffic = {
+        "pages": len(kb_in),
+        "avg_kb": avg(kb_in),
+        "max_kb": round(max(kb_in)) if kb_in else None,
+        "total_mb": round(sum(kb_in) / 1024, 2) if kb_in else None,
+        "avg_requests": avg(per_page("net_requests")),
+        "avg_links_needed": avg(needed, 1),
+        "links_unresolved": sum(needed) - sum(resolved) if needed else None,
+    }
+
     failures = Counter((c.classification, c.error_message or "") for c in calls if c.classification != "ok")
     failure_artifacts = defaultdict(list)
     for c in calls:
@@ -161,13 +180,16 @@ def summarize(calls: list[Call]) -> dict:
         "p95_pass": p95 is not None and p95 <= TARGET_P95_MS,
         "per_query": per_query,
         "stage_avgs": stage_avgs,
+        "traffic": traffic,
         "failures": failures.most_common(),
         "failure_artifacts": failure_artifacts,
     }
 
 
 def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, dict], stopped_reason: str | None) -> str:
-    lines = [f"# Benchmark report `{run_id}`", "", f"> **{LOCAL_LABEL}**", ""]
+    mode = get_settings().proxy_mode
+    label = LOCAL_LABEL if mode == "none" else PROXY_LABEL.format(mode=mode)
+    lines = [f"# Benchmark report `{run_id}`", "", f"> **{label}**", ""]
     lines += [
         f"- Corpus: `{args.corpus}`, repeat {args.repeat}, limit {args.limit or '-'}, concurrency {args.concurrency}, min delay {args.min_delay}s",
         f"- Targets (per corpus): valid >= {TARGET_VALID_RATE:.0%}, P95 <= {TARGET_P95_MS} ms",
@@ -193,6 +215,18 @@ def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, di
             "|---|---|",
         ]
         lines += [f"| {k} | {v if v is not None else '-'} |" for k, v in s["stage_avgs"].items()]
+        t = s["traffic"]
+        lines += [
+            "",
+            "### Traffic (received over the network, from the browser's CDP counters)",
+            "",
+            f"- Pages measured: {t['pages']}; per page avg **{t['avg_kb'] if t['avg_kb'] is not None else '-'} KB**, "
+            f"max {t['max_kb'] if t['max_kb'] is not None else '-'} KB; run total {t['total_mb'] if t['total_mb'] is not None else '-'} MB",
+            f"- Network requests per page (avg): {t['avg_requests'] if t['avg_requests'] is not None else '-'}; "
+            f"/goto links resolved per page (avg): {t['avg_links_needed'] if t['avg_links_needed'] is not None else '-'}, "
+            f"left unresolved in total: {t['links_unresolved'] if t['links_unresolved'] is not None else '-'}",
+            "- Excludes upload (request headers, roughly 0.5-1 KB per request) and TLS overhead; the proxy provider's usage figure is authoritative.",
+        ]
         lines += ["", "### AI Overview per query", "", "| query URL | runs | appeared | complete | avg sources |", "|---|---|---|---|---|"]
         for url, q in s["per_query"].items():
             avg = f"{sum(q['sources']) / len(q['sources']):.1f}" if q["sources"] else "-"

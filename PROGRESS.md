@@ -215,3 +215,63 @@ no request reached Google.
 - [~] Every AI Overview visible in a screenshot is fully extracted with its sources - intro/sections on 11/11, sources on 7/11 (the other 4 are `/goto`-wrapped with no recoverable URL; documented). `ai_overview` is `null` only on the 5 pages without one.
 - [x] All tests pass; a local benchmark report exists (`reports/20260924_203226/`, blocked at request 1).
 - [x] Proxies switch on with config alone.
+
+## Phase 7 - Client review fixes (offline) - DONE
+
+Client review (2026-09-28) found: (1) the classifier returned `aio_incomplete`
+for all 11 saved AI Overview pages, (2) `/goto` organic URLs were rebuilt from
+breadcrumbs, (3) AI Overview sources missing on 4 pages still counted as valid,
+and asked what "working end-to-end" covers. No live requests to Google in this phase.
+
+### Fixed
+- **Classifier false positive.** Every AI Overview ships "An AI Overview is not
+  available for this search" / "Can't generate an AI overview right now" in
+  `display:none` spans; `aio_state` read raw text. `classify.visible_text()` now
+  skips subtrees hidden by inline style, `hidden`, or `data-serp-hidden` (stamped
+  live by the fetcher on elements the browser doesn't render, `MARK_HIDDEN_JS`,
+  so stylesheet-hidden templates are covered too). All 16 pages classify `ok`;
+  the DNS page with the template made visible is `aio_incomplete`.
+- **`/goto` links resolved, not rebuilt.** Research (Sept 2026 public write-ups
+  + the natzir/goto-recover notes): Google rolled out `/goto?url=<token>` for
+  signed-out result links from 26 Aug 2026; the token is encrypted and differs
+  per render; since ~21 Sep the page carries only the domain for organic
+  results; `GET /goto` (not HEAD) answers 302 + `Location`, not tied to cookies,
+  no expiry seen within hours, no rate limit seen at hundreds of req/s. Checked
+  our fixtures: the full destination of `/goto` results is not in the saved HTML
+  (only the domain), so offline recovery is impossible. Breadcrumb URLs were
+  wrong in practice (`https://www.jpmorgan.com/.../Connect`,
+  `https://www.nytimes.com/Electronics/Smartphones`).
+  Now: parsers run once with an empty map to list the tokens the response needs
+  (4-18 per saved page, vs 16-152 `/goto` hrefs on the page), the fetcher
+  resolves them from inside the page (`fetch(redirect:'manual')`, same
+  connection/cookies/proxy) reading `Location` via CDP (Playwright hides the 302
+  once routing is on - verified), falls back to the context's request client
+  (`max_redirects=0`), and `/sorry/` -> `blocked_captcha`. Relative Google links
+  ("More results from site") get their absolute Google URL.
+- **Completeness gate.** Parsers record gaps; any gap fails the page: result/ad
+  links -> `parse_error`, AI Overview source without destination / no source
+  cards / unreadable AI Overview text -> `aio_incomplete`. Product cards
+  (`role=button`, open Google's product viewer, no href) are skipped like
+  Google-hosted sources, not gaps.
+- Side fix: distinct results with the same title and an unresolved URL were
+  merged by the dedupe key (apple lost one "Apple" social result).
+
+### Added
+- `app/links.py`, `app/goto_resolver.py`, `app/netwatch.py` (CDP: bytes received,
+  request count, `/goto` Locations), `app/parsers/context.py`.
+- `X-Timings`: `links_needed/resolved/in_page`, `links_ms`, `bytes_in`,
+  `net_requests`; benchmark report "Traffic" section; proxy runs no longer
+  labelled as the local India run.
+- Config: `GOTO_CONCURRENCY`, `GOTO_TIMEOUT_MS`, `BROWSER_EXECUTABLE_PATH`.
+- Tests: 154 (was 95). `test_pipeline.py` runs classification + parsing +
+  completeness together on all 16 pages; `test_browser_local.py` runs the
+  production browser path in real Chromium against a local stand-in for Google
+  (in-page `/goto` resolution via CDP under routing, hidden-template marking,
+  image blocking, byte counting, `/sorry/`).
+
+### Still unverified live (needs proxy access)
+- Navigation through the proxy, block rate, latency, traffic per page.
+- AI Overview wait/expand clicks.
+- `/goto` resolution against Google itself (the mechanism is from public
+  measurements; ours is a local simulation), and whether the extra 4-18 small
+  requests per page change the block rate.

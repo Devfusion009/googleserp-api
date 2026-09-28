@@ -9,10 +9,12 @@ from dataclasses import dataclass, field
 
 from selectolax.parser import HTMLParser
 
-from .classify import STATUS_FOR, Classification
+from .classify import STATUS_FOR, AioState, Classification
 from .config import Settings
 from .fetcher import FetchResult, Fetcher
 from .models import PageResult, SerpRequest
+from .links import LinkMap
+from .parsers.context import Gap, ParseContext
 from .parsers.registry import PAGE_PARSERS, BlockParser
 from .urls import page_url
 
@@ -30,11 +32,30 @@ ERROR_CODE_FOR = {
 }
 
 
-def build_page_result(page_num: int, tree: HTMLParser, warnings: list[str], parsers: list[BlockParser] = PAGE_PARSERS) -> PageResult:
+def build_page_result(page_num: int, tree: HTMLParser, ctx: ParseContext, parsers: list[BlockParser] = PAGE_PARSERS) -> PageResult:
     fields: dict = {"page": page_num}
     for block_parser in parsers:
-        fields.update(block_parser(tree, warnings))
+        fields.update(block_parser(tree, ctx))
     return PageResult(**fields)
+
+
+def completeness_error(gaps: list[Gap]) -> tuple[str, str] | None:
+    """(error_code, message) when the page was only partly extracted, else None.
+
+    An incomplete extraction is never a valid result. Unresolved result/ad links
+    are parse_error; an AI Overview gap (a source without its destination, or no
+    sources) is aio_incomplete. Both use codes from the agreed list."""
+    if not gaps:
+        return None
+    links = [g for g in gaps if g.field != "ai_overview"]
+    aio = [g for g in gaps if g.field == "ai_overview"]
+    code = "parse_error" if links else "aio_incomplete"
+    parts = []
+    for field_name, group in (("result links", links), ("AI Overview", aio)):
+        if group:
+            shown = "; ".join(g.reason for g in group[:3]) + (f"; +{len(group) - 3} more" if len(group) > 3 else "")
+            parts.append(f"{len(group)} incomplete {field_name}: {shown}")
+    return code, "incomplete extraction - " + " | ".join(parts)
 
 
 @dataclass
@@ -74,7 +95,9 @@ async def run_serp(req: SerpRequest, fetcher: Fetcher, settings: Settings) -> Se
 
         try:
             tree = HTMLParser(result.html or "")
-            page_result = build_page_result(page_idx + 1, tree, all_warnings)
+            ctx = ParseContext(links=LinkMap(resolved=result.links))
+            page_result = build_page_result(page_idx + 1, tree, ctx)
+            all_warnings.extend(ctx.warnings)
         except Exception:
             log.exception("page=%d parse_error", page_idx + 1)
             return SerpOutcome(
@@ -87,6 +110,15 @@ async def run_serp(req: SerpRequest, fetcher: Fetcher, settings: Settings) -> Se
             return SerpOutcome(
                 ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
                 error_code="degraded_page", error_message="page loaded but had zero organic results", status_code=502,
+            )
+        incomplete = completeness_error(ctx.gaps)
+        if incomplete is not None:
+            code, message = incomplete
+            if code == "aio_incomplete":
+                result.aio_state = AioState.incomplete
+            return SerpOutcome(
+                ok=False, first=first, requests_used=requests_used, failed_page=page_idx + 1,
+                error_code=code, error_message=message, status_code=STATUS_FOR[Classification(code)],
             )
         pages.append(page_result)
 

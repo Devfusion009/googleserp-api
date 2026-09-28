@@ -12,17 +12,20 @@ from typing import AsyncContextManager, Protocol
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 
 from .config import Settings
+from .netwatch import NetworkWatch
 from .proxy import ProxyProvider, make_provider, mask_proxy, to_playwright
 
 log = logging.getLogger("serp.browser")
 
 
 class PageSlot(Protocol):
-    """What Fetcher needs from a checked-out slot: a live Playwright Page and
-    the proxy URL it's using (for logging)."""
+    """What Fetcher needs from a checked-out slot: a live Playwright Page, the
+    proxy URL it's using (for logging) and the page's CDP network listener
+    (traffic counts, /goto redirect Locations; None if unavailable)."""
 
     page: Page
     proxy: str | None
+    net: NetworkWatch | None
 
 
 class PagePool(Protocol):
@@ -40,6 +43,7 @@ class Slot:
     page: Page | None = None
     proxy: str | None = None
     locale: str | None = None
+    net: NetworkWatch | None = None
     uses: int = field(default=0)
 
 
@@ -62,6 +66,8 @@ class BrowserManager:
         kwargs = {"headless": self.s.headless}
         if self.s.browser_channel == "chrome":
             kwargs["channel"] = "chrome"
+        if self.s.browser_executable_path:
+            kwargs["executable_path"] = self.s.browser_executable_path
         self.browser = await self._pw.chromium.launch(**kwargs)
         for i in range(max(1, self.s.concurrency)):
             self._slots.put_nowait(Slot(i))
@@ -90,7 +96,7 @@ class BrowserManager:
         proxy = self.provider.next(country) if (self.provider.rotates or slot.context is None) else slot.proxy
         if slot.context is not None and (proxy != slot.proxy or locale != slot.locale):
             await slot.context.close()
-            slot.context = slot.page = None
+            slot.context = slot.page = slot.net = None
         if slot.context is None:
             assert self.browser is not None
             viewport = {"width": self.s.viewport_width, "height": self.s.viewport_height}
@@ -104,6 +110,8 @@ class BrowserManager:
             if self.s.block_resources:
                 await slot.context.route("**/*", self._block)
             slot.page = await slot.context.new_page()
+            slot.net = NetworkWatch()
+            await slot.net.attach(slot.context, slot.page)
             slot.proxy, slot.locale = proxy, locale
         log.info("slot=%d proxy=%s locale=%s", slot.index, mask_proxy(slot.proxy), slot.locale)
 
@@ -121,7 +129,7 @@ class BrowserManager:
                     await slot.context.close()
                 except Exception:
                     pass
-            slot.context = slot.page = None
+            slot.context = slot.page = slot.net = None
             raise
         finally:
             self._slots.put_nowait(slot)
