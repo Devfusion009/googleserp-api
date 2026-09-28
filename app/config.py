@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     api_key: str = ""
     headless: bool = False
     browser_channel: Literal["chromium", "chrome"] = "chromium"
+    browser_executable_path: str = ""
     concurrency: int = 1
     block_resources: bool = True
     blocked_resource_types: str = "image,media,font"
@@ -24,6 +25,8 @@ class Settings(BaseSettings):
     aio_max_wait_ms: int = 8000
     request_deadline_ms: int = 25000
     max_retries: int = 0
+    goto_concurrency: int = 16
+    goto_timeout_ms: int = 3000
     min_delay_seconds: float = 10
     stop_on_block: bool = True
     max_live_requests_per_run: int = 30

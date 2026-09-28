@@ -8,10 +8,13 @@ works" for the human-readable version of these rules):
   - Plain paragraphs (the intro, and the closing "If you'd like..." line): elements
     with class "n6owBd" - these hold flowing prose, not bullets.
   - Bullet lines: plain <li> elements once we're inside the response body.
-  - The sources panel: a <li class="h7wxwc"> per unique source, each holding one
-    <a class="vIWmYe"> (title in aria-label, href is the real destination - no
-    Google redirect wrapper on this link) plus ".gpZmoc" (title text again) and
-    ".hxIQcc" (snippet). This panel always comes after the response's own text in
+  - The sources panel: a <li class="h7wxwc"> per source card, each holding one
+    <a class="vIWmYe"> (title in aria-label; href is either the real destination
+    or Google's /goto?url=<token> wrapper, resolved through ParseContext.links -
+    see app/links.py) plus ".gpZmoc" (title text again) and ".hxIQcc" (snippet).
+    A card whose destination can't be resolved is a gap (the page fails as
+    aio_incomplete), and so is an AI Overview with no source cards at all or no
+    readable text. This panel always comes after the response's own text in
     document order, so it also marks where we stop reading intro/section text -
     the one paragraph Google adds after the last heading ("If you'd like to know
     more, ask about X or Y") is real response text and stays attached to the last
@@ -26,7 +29,8 @@ from urllib.parse import urlsplit
 
 from selectolax.parser import HTMLParser, Node
 
-from ..urls import strip_text_fragment, unwrap_google_redirect
+from ..urls import strip_text_fragment
+from .context import ParseContext
 from .misc import clean_prose, clean_text, dedupe_consecutive, node_text
 
 log = logging.getLogger("serp.parsers.aio")
@@ -73,27 +77,28 @@ def _is_heading3(node: Node) -> bool:
     return node.attributes.get("role") == "heading" and node.attributes.get("aria-level") == "3"
 
 
-def _resolve_source_url(href: str | None) -> str | None:
-    if not href:
-        return None
-    url = unwrap_google_redirect(href) if href.startswith("/") else href
-    url = strip_text_fragment(url)
-    if not url:
-        return None
+def _is_google(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
-    if host == "google.com" or host.endswith(".google.com"):
-        return None
-    return url
+    return host == "google.com" or host.endswith(".google.com")
 
 
-def _parse_sources(root: Node, warnings: list[str]) -> list[AioSource]:
+def _parse_sources(root: Node, ctx: ParseContext, warnings: list[str]) -> list[AioSource]:
     sources: list[AioSource] = []
     seen: set[str] = set()
     for item in root.css(f"li.{SOURCE_ITEM_CLASS}"):
         link = item.css_first(f"a.{SOURCE_LINK_CLASS}")
-        url = _resolve_source_url(link.attributes.get("href")) if link else None
+        href = link.attributes.get("href") if link else None
+        if link is not None and not href and link.attributes.get("role") == "button":
+            # A product card: opens Google's own product viewer in the page and
+            # has no web destination - not listed, like other Google-hosted sources.
+            warnings.append(f"aio product card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r} has no web destination; not listed")
+            continue
+        url = strip_text_fragment(ctx.links.resolve(href))
         if not url:
-            warnings.append("aio source item had no resolvable url; skipped")
+            ctx.gap("ai_overview", f"source card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r}: {ctx.link_problem(href)}")
+            continue
+        if _is_google(url):
+            warnings.append(f"aio source links to Google itself ({url[:60]}); not listed")
             continue
         if url in seen:
             continue
@@ -104,10 +109,12 @@ def _parse_sources(root: Node, warnings: list[str]) -> list[AioSource]:
     return sources
 
 
-def parse_aio(root: Node) -> ParsedAio:
+def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
     """root is the AI Overview container, as returned by classify.find_aio_root."""
+    ctx = ctx if ctx is not None else ParseContext()
     warnings: list[str] = []
-    sources = _parse_sources(root, warnings)
+    has_cards = root.css_first(f"li.{SOURCE_ITEM_CLASS}") is not None
+    sources = _parse_sources(root, ctx, warnings)
 
     for badge in root.css(f".{CITATION_BADGE_CLASS}"):
         badge.remove()
@@ -157,9 +164,14 @@ def parse_aio(root: Node) -> ParsedAio:
     intro = dedupe_consecutive(intro_parts)
 
     if not intro and not sections:
-        warnings.append("AI Overview root had no readable intro/sections text")
+        # The block is on the page; returning ai_overview: null would pass it off
+        # as a page without one.
+        ctx.gap("ai_overview", "AI Overview text could not be read")
+    elif not has_cards:
+        ctx.gap("ai_overview", "no source cards found")
 
     for w in warnings:
         log.warning(w)
+    ctx.warnings.extend(warnings)
 
     return ParsedAio(intro=intro, sections=[s for s in sections if s.text], sources=sources, warnings=warnings)

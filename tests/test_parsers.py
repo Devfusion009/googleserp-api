@@ -6,7 +6,9 @@ import pytest
 from selectolax.parser import HTMLParser
 
 from app.classify import find_aio_root
+from app.links import LinkMap, goto_token
 from app.parsers.ads import parse_ads
+from app.parsers.context import ParseContext
 from app.parsers.knowledge_panel import parse_knowledge_panel
 from app.parsers.misc import parse_number_of_results, parse_suggestions
 from app.parsers.organic import parse_organic_results
@@ -58,28 +60,61 @@ def test_dns_first_result_title_and_url():
     assert any(sl.url and sl.url.startswith("https://www.cloudflare.com") for sl in results[0].sub_links)
 
 
-def test_wikipedia_first_result_title_and_url():
+def test_goto_result_url_is_never_rebuilt_from_the_breadcrumb():
+    # wikipedia's links are all /goto-wrapped. Unresolved, the url is None and
+    # the gap is recorded - the breadcrumb ("https://www.wikipedia.org") is not
+    # used, it is often only the domain.
     tree = tree_for("wikipedia")
-    results, _ = parse_organic_results(tree.css_first("#rso"))
+    ctx = ParseContext()
+    results, _ = parse_organic_results(tree.css_first("#rso"), ctx)
     assert results[0].title == "Wikipedia"
-    assert results[0].url == "https://www.wikipedia.org"
+    assert results[0].url is None
+    assert any("Wikipedia" in g.reason and "/goto" in g.reason for g in ctx.gaps)
 
 
-def test_wikipedia_sitelinks_without_real_hrefs_are_null_not_guessed():
+def test_goto_result_url_comes_from_the_resolved_map():
     tree = tree_for("wikipedia")
-    results, _ = parse_organic_results(tree.css_first("#rso"))
-    wikipedia_org = results[0]
-    assert wikipedia_org.sub_links  # the language-switcher row is picked up...
-    assert all(sl.url is None for sl in wikipedia_org.sub_links)  # ...but never with a fabricated url
+    href = tree.css_first("#rso a h3").parent.attributes["href"]
+    token = goto_token(href)
+    ctx = ParseContext(links=LinkMap(resolved={token: "https://www.wikipedia.org/"}))
+    results, _ = parse_organic_results(tree.css_first("#rso"), ctx)
+    assert results[0].url == "https://www.wikipedia.org/"
 
 
-# On these fixtures Google wrapped every AIO source link (and gave no cite/
-# breadcrumb fallback) in its opaque /goto redirect - seen the same way on
-# organic results in app/parsers/organic.py. We can't decode it (that would be
-# reverse-engineering Google's script) and there's no visible fallback text
-# here to rebuild a URL from, so every source in the panel is correctly
-# skipped rather than emitted with a guessed or missing url. A real gap to
-# flag for the client - see PROGRESS.md.
+def test_goto_sitelinks_resolve_through_the_map_and_are_gaps_otherwise():
+    tree = tree_for("wikipedia")
+    ctx = ParseContext()
+    results, _ = parse_organic_results(tree.css_first("#rso"), ctx)
+    langs = results[0].sub_links
+    assert [sl.title for sl in langs][:2] == ["English", "Deutsch"]
+    assert all(sl.url is None for sl in langs)  # never a fabricated url...
+    assert sum("sub-link" in g.reason for g in ctx.gaps) == len(langs)  # ...and each one is a gap
+
+    resolved = {t: f"https://resolved.test/{i}" for i, t in enumerate(ctx.links.wanted)}
+    ctx2 = ParseContext(links=LinkMap(resolved=resolved))
+    results2, _ = parse_organic_results(tree_for("wikipedia").css_first("#rso"), ctx2)
+    assert all(sl.url and sl.url.startswith("https://resolved.test/") for sl in results2[0].sub_links)
+    assert not ctx2.gaps
+
+
+def test_more_results_from_site_link_is_its_real_google_url():
+    tree = tree_for("why_is_the_sky_blue")
+    results, _ = parse_organic_results(tree.css_first("#rso"), ParseContext())
+    more = [sl for r in results for sl in r.sub_links if sl.title.startswith("More results from")]
+    assert more and more[0].url.startswith("https://www.google.com/search?q=why+is+the+sky+blue+site:www.reddit.com")
+
+
+def test_distinct_unresolved_results_with_same_title_are_not_merged():
+    # apple has two different "Apple" social-profile results; before, an
+    # unresolved url made them share the dedupe key and one was dropped.
+    tree = tree_for("apple")
+    results, _ = parse_organic_results(tree.css_first("#rso"), ParseContext())
+    assert [r.title for r in results].count("Apple") == 3
+
+
+# On these fixtures Google wrapped every AIO source link in /goto. Offline the
+# destinations are unknown: sources stay empty and every card is a gap (the page
+# fails as aio_incomplete); live, the fetcher resolves them - see test_pipeline.py.
 GOTO_WRAPPED_AIO_SOURCES = {"apple", "best_cell_phone_plans", "mobile", "t_mobile"}
 
 
@@ -94,7 +129,9 @@ def test_aio_present_fixtures_have_intro_and_sections(slug):
     for s in result.sections:
         assert s.text, f"{slug}: section {s.title!r} has empty text"
     if slug in GOTO_WRAPPED_AIO_SOURCES:
-        assert result.sources == []
+        ctx = ParseContext()
+        assert parse_aio(find_aio_root(tree_for(slug)), ctx).sources == []
+        assert ctx.gaps and all(g.field == "ai_overview" for g in ctx.gaps)
         return
     assert result.sources, f"{slug}: AI Overview has no sources"
     for src in result.sources:
@@ -111,8 +148,9 @@ def test_no_aio_fixtures_have_no_ai_overview(slug):
 
 def test_car_insurance_ads_and_aio_together():
     tree = tree_for("car_insurance_quotes")
-    warnings = []
-    ads = parse_ads(tree.css_first("#tads"), warnings) + parse_ads(tree.css_first("#bottomads"), warnings)
+    ctx = ParseContext()
+    ads = parse_ads(tree.css_first("#tads"), ctx) + parse_ads(tree.css_first("#bottomads"), ctx)
+    assert not ctx.gaps
     assert len(ads) >= 1
     assert all(a.url and a.url.startswith("http") for a in ads)
     assert all(a.title for a in ads)
@@ -125,9 +163,9 @@ def test_car_insurance_ads_and_aio_together():
 
 def test_ads_empty_is_normal_not_a_failure():
     tree = tree_for("wikipedia")
-    warnings = []
-    assert parse_ads(tree.css_first("#tads"), warnings) == []
-    assert warnings == []
+    ctx = ParseContext()
+    assert parse_ads(tree.css_first("#tads"), ctx) == []
+    assert ctx.warnings == [] and ctx.gaps == []
 
 
 def test_knowledge_panel_eiffel_tower():

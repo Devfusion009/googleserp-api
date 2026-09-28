@@ -14,12 +14,22 @@ degraded or incomplete page is reported as a failure, not a result.
 
 | Area | State |
 |---|---|
-| API (`POST /serp`, `GET /health`), exact response schema | Done, 95 tests passing |
-| Parsers (organic, ads, AI Overview, knowledge panel, count, suggestions) | Done, tested against 16 real saved Google pages |
+| API (`POST /serp`, `GET /health`), exact response schema | Done |
+| Classification + parsing on the 16 real saved Google pages | Done and tested together, end to end (`tests/test_pipeline.py`): all 16 classify `ok`, the 11 AI Overviews as complete. The 10 pages with direct links return a valid result offline; the 6 with `/goto` links fail honestly offline (their destinations need Google's redirect) and pass once the links are resolved. |
+| `/goto` result links (organic, sitelinks, AI Overview sources, ads) | Resolved to the real destination through Google's own redirect while the page is open - never rebuilt from the breadcrumb. Verified with a real browser against a local stand-in for Google (`tests/test_browser_local.py`); **not yet run against live Google**. |
+| Completeness | A result link without its destination, or an AI Overview source card without one, fails the page (`parse_error` / `aio_incomplete`) - partial extractions are never returned as valid. |
 | Proxy support | Done - switch on with config only (see [Proxies](#proxies)) |
-| Benchmark client | Done - see [Benchmark](#benchmark) |
+| Benchmark client | Done - see [Benchmark](#benchmark); now also reports traffic per page |
 | **Live performance numbers** | **Not available yet.** The development machine's IP (India, no proxy) gets Google's "unusual traffic" CAPTCHA on the very first request, every time. The one local benchmark run stopped after 1 request (`blocked_captcha`). Valid-rate and latency against the client's targets can only be measured through the client's US residential proxies. |
-| Live AI Overview wait/expand logic | Written, never exercised live (same reason). Parsers are verified; the in-browser waiting/clicking is not. |
+| Live AI Overview wait/expand logic | Written, never exercised live (same reason). Parsers and classification are verified on saved pages; the in-browser waiting/clicking is not. |
+
+"End to end" today means: a saved real Google page goes through the same
+classifier, `/goto` token collection, parsers, completeness gate and error
+mapping as a live request (fixtures), and the browser half - navigation,
+resource blocking, hidden-element marking, in-page `/goto` resolution, traffic
+counting - runs in a real Chromium against a local server. What has **not** run
+against live Google: navigation through a proxy, the AI Overview wait/expand
+clicks, and `/goto` resolution on Google's servers.
 
 Details, decisions and history are in [`PROGRESS.md`](PROGRESS.md).
 
@@ -104,8 +114,8 @@ If `API_KEY` is set, add `-H 'X-API-Key: <key>'`. `/health` never needs a key.
 | 429 | `blocked_captcha` | Google CAPTCHA / "unusual traffic" (`/sorry/`) |
 | 502 | `consent_wall` | "Before you continue" consent page |
 | 502 | `degraded_page` | JavaScript-required notice, basic-HTML version, no results container, or zero organic results |
-| 502 | `aio_incomplete` | an AI Overview is on the page but didn't finish loading/expanding in time, or Google shows its "can't generate an AI Overview right now" message |
-| 502 | `parse_error` | the page loaded but parsing crashed |
+| 502 | `aio_incomplete` | an AI Overview is on the page but didn't finish loading/expanding in time, Google visibly shows its "can't generate an AI Overview right now" message, or a source card's destination couldn't be resolved / no source cards were found |
+| 502 | `parse_error` | the page loaded but parsing crashed, or a result's destination URL couldn't be resolved (incomplete extraction) |
 | 502 | `network_error` | browser/network failure |
 | 504 | `timeout` | navigation or the overall request deadline timed out |
 
@@ -115,8 +125,11 @@ request fails (see [Assumptions](#assumptions-to-confirm-with-the-client)).
 
 **Debug headers** (never in the JSON body): `X-Request-Id`, `X-Classification`,
 `X-AIO-State` (`absent` / `complete` / `incomplete`), `X-Timings` (JSON: `nav_ms`,
-`results_ms`, `aio_ms`, `total_ms`, `attempt`), `X-Artifact-Dir` (saved HTML +
-screenshot for this request, when `DEBUG_ARTIFACTS=true`).
+`results_ms`, `aio_ms`, `links_ms`, `total_ms`, `attempt`; `links_needed` /
+`links_resolved` / `links_in_page` for `/goto` resolution; `bytes_in` and
+`net_requests` - bytes received over the network and requests made for the
+page), `X-Artifact-Dir` (saved HTML + screenshot for this request, when
+`DEBUG_ARTIFACTS=true`).
 
 ## Configuration
 
@@ -128,6 +141,7 @@ All settings come from `.env` (see `.env.example`) or environment variables.
 | `API_KEY` | empty | if set, `POST /serp` requires `X-API-Key: <value>` |
 | `HEADLESS` | `false` | `true` for servers without a display |
 | `BROWSER_CHANNEL` | `chromium` | `chromium` (Playwright's bundled build) or `chrome` (installed Google Chrome). No stealth/fingerprint patches either way. |
+| `BROWSER_EXECUTABLE_PATH` | empty | use a Chromium binary at this path instead of Playwright's own download |
 | `CONCURRENCY` | `1` | number of browser pages kept open and used in parallel |
 | `BLOCK_RESOURCES` | `true` | skip images, media and fonts (scripts and stylesheets are never blocked - the AI Overview needs them) |
 | `NAV_TIMEOUT_MS` | `15000` | navigation timeout, and max wait for the results container |
@@ -135,6 +149,8 @@ All settings come from `.env` (see `.env.example`) or environment variables.
 | `AIO_MAX_WAIT_MS` | `8000` | max time for a present AI Overview to finish loading and expand; beyond this -> `aio_incomplete` |
 | `REQUEST_DEADLINE_MS` | `25000` | hard cap per page load -> `timeout` |
 | `MAX_RETRIES` | `0` | retries for `timeout` / `network_error` only - never for a CAPTCHA |
+| `GOTO_CONCURRENCY` | `16` | `/goto` links resolved in parallel per page |
+| `GOTO_TIMEOUT_MS` | `3000` | timeout for one `/goto` resolution; an unresolved link fails the page |
 | `MIN_DELAY_SECONDS` | `10` | minimum gap between live requests in the benchmark and fixture tools |
 | `STOP_ON_BLOCK` | `true` | benchmark and fixture capture stop at the first CAPTCHA (set `false` only with a rotating proxy list) |
 | `MAX_LIVE_REQUESTS_PER_RUN` | `30` | the benchmark / fixture tools refuse bigger runs unless `--allow-more` |
@@ -163,6 +179,15 @@ In a list file, a literal `{country}` in a line is replaced with the request's
 providers that select the exit country through the username. Credentials are
 masked in logs (`http://use***@host:port`); every request logs which (masked)
 proxy it used.
+
+**Sticky sessions are required.** Everything for one page - the search, its
+scripts, the AI Overview's follow-up requests and the `/goto` resolutions -
+must leave from the same IP as the cookies Google set, so the proxy URL must pin
+a session (usually a session id in the username) for longer than a request
+takes; 10-30 minutes lets one browser context stay warm (cookies, cached
+scripts) across many requests. `static` uses one session for every slot.
+`list` rotates per request and rebuilds the browser context each time, so every
+request starts with a cold cache (more traffic per page).
 
 ## Benchmark
 
@@ -196,15 +221,35 @@ The corpora are `bench/corpora/mixed.txt` (15 queries, US/English) and
 .venv/bin/python -m pytest
 ```
 
-95 tests, all offline (no browser, no Google): URL rules and pass-through
-(including the difficult URL reaching the browser byte-for-byte), the
-classifier (real CAPTCHA page + small `synthetic_*` pages), every parser against
-16 real saved Google pages in `tests/fixtures/`, the API end to end with the
-fetcher mocked, and the benchmark's maths and stop rules.
+154 tests, none touching Google (2 of them need a local Chromium and are
+skipped without one):
+
+- `test_pipeline.py` - **classification and parsing together** on the 16 real
+  saved pages: each goes through `classify_page`, the fetcher's `/goto` token
+  collection, the parsers and the completeness gate, as a live request would.
+  All 16 classify `ok` with the right AI Overview state (the hidden failure
+  templates don't count; the same page with the template made visible is
+  `aio_incomplete`); the 10 direct-link pages return a valid result; the 6
+  `/goto` pages fail as incomplete with nothing resolved and pass once resolved;
+  unresolved AI Overview sources alone give `aio_incomplete`.
+- `test_parsers.py` - every parser against the real pages (field values, no
+  breadcrumb URLs, sitelinks, suggestions, knowledge panel, ads).
+- `test_links.py` - link rules and the `/goto` resolver (in-page, fallback,
+  `/sorry/`, no redirects followed) with the browser faked.
+- `test_browser_local.py` - the production browser path (BrowserManager +
+  Fetcher + run_serp, resource blocking on) in a real Chromium against a local
+  stand-in for Google: `/goto` links resolved in the page through CDP,
+  stylesheet-hidden failure templates ignored, images blocked, bytes counted,
+  `/sorry/` -> `blocked_captcha`. Skipped if no Chromium can be launched (set
+  `BROWSER_EXECUTABLE_PATH` if Playwright's own build isn't installed).
+- URL rules and pass-through (the difficult URL reaches the browser
+  byte-for-byte), the classifier on the real CAPTCHA page, the API with the
+  fetcher mocked, and the benchmark's maths and stop rules.
 
 `scripts/capture_fixtures.py` lists which fixtures exist (default) or re-fetches
 missing ones live (`--live`, paced, stops at a CAPTCHA). `scripts/demo_parse.py
-<slug>` prints one fixture as the API's JSON, to compare with its screenshot.
+<slug>` runs one saved page through the classifier, parsers and completeness
+check and prints the result, to compare with its screenshot.
 
 ## How parsing works
 
@@ -217,23 +262,58 @@ named in the parser's docstring so it's easy to update.
 Google often renders a hidden accessibility copy right next to visible text; an
 exact repeat of the line immediately before it is dropped. A section that fails
 to parse logs a warning and leaves that field empty - the rest of the response
-still returns.
+still returns. Something that is on the page but can't be extracted completely
+(a result link with no known destination, an AI Overview source card without
+one) is different: it fails the page - see [Completeness](#completeness).
+
+**Classification only counts visible text.** Google ships hidden templates next
+to real content - every AI Overview carries "An AI Overview is not available for
+this search" and "Can't generate an AI overview right now" in `display:none`
+spans, shown only when generation fails. Subtrees hidden by inline style, the
+`hidden` attribute or (live) a stylesheet are skipped: before capturing the
+page the fetcher stamps `data-serp-hidden` on elements inside the AI Overview
+that the browser doesn't render, and the classifier skips those too.
+
+**Result links and Google's `/goto` wrapper.** Since 26 Aug 2026 Google serves
+signed-out result links as `/goto?url=<token>` (organic results, sitelinks, AI
+Overview sources). The token is encrypted and different on every render, so it
+can't be decoded, and the page itself carries at most the domain (the visible
+breadcrumb is often just `https://site.com`, or category labels that aren't a
+real path). The only reliable source is Google's own redirect: `GET
+/goto?url=<token>` answers `302` with the destination in `Location`. After the
+page has loaded (and the AI Overview is expanded), the fetcher:
+
+1. runs the parsers once to learn exactly which `/goto` links the response will
+   contain (not every `/goto` on the page),
+2. requests those from inside the results page with `fetch(..., {redirect:
+   'manual'})` - same HTTP/2 connection, cookies and proxy session as the page,
+   redirect not followed, so the destination site is never contacted - and reads
+   each `Location` through the Chrome DevTools Protocol,
+3. retries anything missed through the browser context's own request client
+   (same proxy, still no redirect followed),
+4. hands the parsers the token -> destination map.
+
+A `/sorry/` answer makes the page `blocked_captcha`. A link that still has no
+destination is never replaced by a guess: its `url` stays `null` and the page
+fails as incomplete. Links on Google's own hosts (e.g. `play.google.com`) are
+not wrapped and are used as-is.
 
 **Organic** - each link containing an `<h3>` inside `#rso`, in page order. Its
 result is the nearest ancestor with a `data-hveid` attribute. `title` is the
 `<h3>`, `content` is the snippet, `sub_links` are real extra links in the result
-(jump-to-section links, sitelink rows). The URL is the link's real destination:
-used as-is when Google gives it directly, unwrapped from `/url?q=`, or - when
-Google uses its opaque `/goto?url=<token>` wrapper - rebuilt from the visible
-breadcrumb under the title (see [Known limitations](#known-limitations)).
-Carousels, videos-only modules, People Also Ask, local packs, the flights module
-and the forums module have no `<a><h3>` result in this sense and are not
-included.
+(jump-to-section links, sitelink rows, "More results from site"). The URL is the
+link's real destination: used as-is when Google gives it directly, unwrapped from
+`/url?q=`, or resolved from `/goto` as above. A Google-internal link (e.g. "More
+results from www.reddit.com", `/search?q=...+site:...`) gets its absolute Google
+URL, which is where it really goes. Carousels, videos-only modules, People Also
+Ask, local packs, the flights module and the forums module have no `<a><h3>`
+result in this sense and are not included.
 
 **Paid** - every `[data-text-ad]` inside `#tads` (top) and `#bottomads` (bottom),
-in order, same shape as organic. The ad's own link is already the real
-destination; ad sitelinks going through `/aclk?...&adurl=` use the `adurl`
-value. Pages with no ads have empty `#tads`/`#bottomads`, so `paid: []` is
+in order, same shape as organic. In the saved pages the ad's own link is already
+the real destination; ad sitelinks going through `/aclk?...&adurl=` use the
+`adurl` value, and a `/goto`-wrapped ad link would be resolved like organic
+ones. Pages with no ads have empty `#tads`/`#bottomads`, so `paid: []` is
 normal.
 
 **AI Overview** - found from the heading whose text is exactly "AI Overview".
@@ -258,9 +338,13 @@ top to bottom with these rules:
 - Reading stops at the sources panel, so source cards never leak into the text.
 - **sources**: every card in the sources panel (`li.h7wxwc`), including the ones
   only visible after "Show all" (the fetcher clicks "Show more" and "Show all"
-  first). Each card gives `title`, `url` (the card link's real destination) and
-  `snippet`. URLs are de-duplicated, `#:~:text=` fragments are stripped, and
-  `google.com` links are dropped.
+  first). Each card gives `title`, `url` (the card link's real destination,
+  resolved from `/goto` when wrapped) and `snippet`. URLs are de-duplicated,
+  `#:~:text=` fragments are stripped, and `google.com` links are dropped.
+  Product cards (a `role="button"` card that opens Google's product viewer in
+  the page) have no web destination and are not listed either. A card whose
+  destination can't be resolved, or an AI Overview with no source cards at all,
+  makes the request `aio_incomplete`.
 
 **Knowledge panel** - from `#rhs`: `title` and `subtitle` from the panel header,
 `description` and `source_url` from the `description` block (the attribution
@@ -280,24 +364,41 @@ search for" carousel of related entities.
 **corrections** - the corrected query from "Showing results for", "Search
 instead for" or "Did you mean", else `[]`.
 
+## Completeness
+
+A response is valid only if everything the page shows in the fields we return
+was extracted. Each parser records a *gap* when it sees something it can't
+extract completely; any gap fails the page:
+
+| gap | error |
+|---|---|
+| an organic result, sitelink or ad whose destination is unknown (e.g. a `/goto` link that didn't resolve) | `parse_error` - "incomplete extraction - N incomplete result links: ..." |
+| an AI Overview source card whose destination is unknown, or an AI Overview with no source cards | `aio_incomplete` - "incomplete extraction - N incomplete AI Overview: ..." |
+
+The message names the first few items. A page with zero organic results is
+still `degraded_page` first.
+
 ## Assumptions to confirm with the client
 
-1. **`/goto` URLs.** When Google hides a result's destination behind its opaque
-   `/goto?url=<token>` wrapper, we rebuild the URL from the visible breadcrumb
-   (e.g. `https://en.wikipedia.org › wiki › Apple_Inc` -> `https://en.wikipedia.org/wiki/Apple_Inc`).
-   That's real on-page text, but it can be only the site root when Google shows
-   no breadcrumb. Acceptable, or should such results carry `url: null`?
-2. **Partial pages.** With `results > 10`, if page 1 succeeds and page 2 is
+1. **Unresolved links fail the page.** A result/sitelink/ad whose destination
+   can't be resolved is reported as `parse_error` (and an AI Overview source as
+   `aio_incomplete`) - the closest codes in the agreed list. A dedicated code
+   (e.g. `incomplete_result`) can be added if preferred. The breadcrumb is no
+   longer used to rebuild URLs.
+2. **Sources that aren't web pages** - AI Overview source cards pointing at
+   Google itself (e.g. Google Flights) and product cards that open Google's
+   product viewer - are left out of `sources` rather than failing the page.
+3. **Partial pages.** With `results > 10`, if page 1 succeeds and page 2 is
    blocked, we return the error with `results: []` (per "results: [] on error"),
    discarding page 1. Alternative: return successful pages plus an error flag.
-3. **"Can't generate an AI Overview right now"** is counted as `aio_incomplete`
-   (a failure), not as `ai_overview: null`.
-4. **Bold-labelled groups** inside AI Overview lists stay as `"- Label: text"`
+4. **"Can't generate an AI Overview right now"**, when Google actually shows it,
+   is counted as `aio_incomplete` (a failure), not as `ai_overview: null`.
+5. **Bold-labelled groups** inside AI Overview lists stay as `"- Label: text"`
    lines within their heading's section rather than becoming sections of their
    own; the closing paragraph stays in the last section.
-5. **Malformed request bodies** return 400 with `error: "invalid_url"`, the
+6. **Malformed request bodies** return 400 with `error: "invalid_url"`, the
    closest code in the agreed list.
-6. **Mid-page "in-feed" ads** (not in the top or bottom ad block) are not
+7. **Mid-page "in-feed" ads** (not in the top or bottom ad block) are not
    included in `paid`, which the brief defines as top and bottom ads.
 
 ## Known limitations
@@ -309,15 +410,21 @@ instead for" or "Did you mean", else `[]`.
   waiting for it to settle and clicking "Show more"/"Show all" has only been
   tested with mocks. The hooks it uses (the "AI Overview" heading, `aria-busy`,
   text-length stability) are reasonable but unconfirmed on a live page.
-- **`/goto`-wrapped AI Overview sources.** On 4 of the 11 fixtures with an AI
-  Overview (apple, mobile, t_mobile, best_cell_phone_plans) Google wrapped every
-  source card link in `/goto` and showed no URL text to fall back to. Those
-  sources can't be recovered without reverse-engineering Google's script, so
-  `sources` is empty on those pages even though cards are visible. Intro and
-  sections are unaffected.
-- **`/goto` organic URLs** can be less precise than the real destination (see
-  assumption 1); sitelinks in Google's "site links" table layout have no link in
-  the page at all, so their `sub_links` are empty.
+- **`/goto` resolution untested against live Google.** The mechanism (302 +
+  `Location`, `GET` not `HEAD`, token not tied to cookies, no expiry within
+  hours) follows public measurements from September 2026 and was verified in a
+  real browser against a local server, not against Google. It adds one small
+  request to `www.google.com` per `/goto` link in the response - 4 to 18 on the
+  saved pages (out of 16-152 `/goto` links on those pages), run 16 at a time over
+  the page's existing connection; whether that changes the block rate is one of
+  the things the first proxy run measures (`X-Timings` `links_*`, report
+  "Traffic" section).
+- **Saved `/goto` pages can't be fully checked offline.** 6 of the 16 fixtures
+  (apple, best_cell_phone_plans, chase_bank_login, mobile, t_mobile, wikipedia)
+  use `/goto`; their destinations were never captured, so offline they fail as
+  incomplete and the tests check them with stand-in destinations.
+- **Sitelinks in Google's "site links" table layout** have no link in the page
+  at all (they are buttons), so their `sub_links` are empty.
 - **Video results** in `organic` carry extra text in `content` (chapter
   timestamps, "key moments").
 - **Knowledge panel** hooks are confirmed on only one fixture (Eiffel Tower); the
@@ -332,7 +439,8 @@ instead for" or "Did you mean", else `[]`.
 
 1. **Run through the client's US residential proxies.** Set `PROXY_MODE` and
    run the benchmark (start small: `--limit 3`, then the full corpora). This is
-   the first real measurement of block rate and latency.
+   the first real measurement of block rate, latency, traffic per page and
+   `/goto` resolution on Google's servers.
 2. **Confirm the AI Overview wait logic on live pages.** Check `X-AIO-State` and
    the saved screenshots for queries known to have an AI Overview; tune
    `AIO_APPEAR_WAIT_MS` / `AIO_MAX_WAIT_MS` and the loading signals.
@@ -356,12 +464,16 @@ app/
   main.py        FastAPI app: POST /serp, GET /health, debug headers
   config.py      settings from .env
   models.py      request/response models (client's exact schema)
+  orchestrator.py  one /serp request: pages, parsers, completeness gate, error codes
   browser.py     Playwright lifecycle, page pool, resource blocking, proxy per context
+  netwatch.py    CDP listener per page: bytes received, /goto redirect Locations
   proxy.py       NoProxy / StaticProxy / ListProxy
-  fetcher.py     navigate, classify early, wait for results + AI Overview, expand, capture, timings
-  classify.py    CAPTCHA / consent / degraded / AI Overview state (pure functions)
+  fetcher.py     navigate, classify early, wait for results + AI Overview, expand, capture, resolve /goto, timings
+  goto_resolver.py  resolve /goto links through Google's redirect (in page, then fallback)
+  links.py       href -> destination rules, /goto tokens, Location checks
+  classify.py    CAPTCHA / consent / degraded / AI Overview state, visible text only (pure functions)
   urls.py        URL validation, extra-page URLs, redirect unwrapping, fragment stripping
-  parsers/       organic.py, ads.py, aio.py, knowledge_panel.py, misc.py
+  parsers/       organic.py, ads.py, aio.py, knowledge_panel.py, misc.py, context.py (links, warnings, gaps), registry.py
 bench/
   run_bench.py   benchmark client
   corpora/       mixed.txt, difficult.txt

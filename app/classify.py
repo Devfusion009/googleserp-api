@@ -1,7 +1,10 @@
 """Page classification. Pure functions of (final URL, HTML) - no browser needed.
 
-The AI Overview hooks here are starting points; Phase 3 confirms them against
-real fixture pages and the README documents the final rules.
+Only text a user could see counts. Google ships hidden templates next to real
+content - e.g. every AI Overview carries "An AI Overview is not available for
+this search" and "Can't generate an AI overview right now" in display:none
+spans, shown only when generation fails. Matching those in raw text flagged
+every real AI Overview as failed, so all text checks go through visible_text().
 """
 import re
 from dataclasses import dataclass
@@ -68,14 +71,38 @@ class PageVerdict:
     aio_state: AioState = AioState.absent
 
 
-def _visible_text(tree: HTMLParser) -> str:
-    body = tree.body
-    if body is None:
+# Marks an element the browser does not render. Inline style and the `hidden`
+# attribute are visible in saved HTML; the fetcher also stamps HIDDEN_MARK on
+# elements hidden by a stylesheet (see fetcher.MARK_HIDDEN_JS) before capturing.
+HIDDEN_MARK = "data-serp-hidden"
+HIDDEN_STYLE_RE = re.compile(r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b", re.I)
+NON_TEXT_TAGS = {"script", "style", "noscript", "template"}
+
+
+def _is_hidden(node: Node) -> bool:
+    attrs = node.attributes
+    if node.tag in NON_TEXT_TAGS or "hidden" in attrs or HIDDEN_MARK in attrs:
+        return True
+    return bool(HIDDEN_STYLE_RE.search(attrs.get("style") or ""))
+
+
+def visible_text(node: Node | None) -> str:
+    """Lower-cased, whitespace-collapsed text of `node` without hidden subtrees."""
+    if node is None:
         return ""
-    clone = HTMLParser(body.html or "")
-    clone.strip_tags(["script", "style", "noscript", "template"])
-    text = clone.body.text(separator=" ") if clone.body else ""
+    clone = HTMLParser(node.html or "")
+    hidden = [n for n in clone.css(f"[hidden], [{HIDDEN_MARK}], [style], {', '.join(NON_TEXT_TAGS)}") if _is_hidden(n)]
+    # css() is document order; reversed, descendants go before their ancestors,
+    # so no node is decomposed after its parent already was.
+    for n in reversed(hidden):
+        n.decompose()
+    root = clone.body or clone.root
+    text = root.text(separator=" ") if root else ""
     return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _visible_text(tree: HTMLParser) -> str:
+    return visible_text(tree.body)
 
 
 def find_aio_root(tree: HTMLParser) -> Node | None:
@@ -99,7 +126,7 @@ def aio_state(tree: HTMLParser) -> tuple[AioState, str]:
     root = find_aio_root(tree)
     if root is None:
         return AioState.absent, "no AI Overview heading"
-    text = re.sub(r"\s+", " ", root.text(separator=" ")).strip().lower()
+    text = visible_text(root)
     for t in AIO_FAILED_TEXT:
         if t in text:
             return AioState.incomplete, f"AI Overview shows '{t}'"

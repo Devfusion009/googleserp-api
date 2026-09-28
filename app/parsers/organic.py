@@ -5,26 +5,21 @@ link we climb to its per-result container - the nearest ancestor carrying a
 data-hveid attribute, which every individual #rso item has regardless of type
 (plain web result, video result, etc) - then read the rest of that container.
 
-Google renders each result's URL two different ways depending on the query/
-session (both seen in real fixtures):
-  - a plain href with the real destination already in it (most common), or
-  - href="/goto?url=<opaque token>" - a newer click-wrapper we cannot decode
-    (doing so would mean reverse-engineering Google's script, which the brief
-    forbids). When we see this, we fall back to the visible <cite> breadcrumb
-    text (e.g. "https://en.wikipedia.org/ wiki / Apple_Inc") and rebuild a URL
-    from it. This is real, on-page text, not a guess - but it is sometimes
-    only the site root when Google doesn't show a full breadcrumb, so the
-    reconstructed URL can be less precise than the true destination. We log a
-    parse warning whenever we fall back to this path.
+URLs come from ParseContext.links (app/links.py): a direct href is used as-is,
+/url?q= is unwrapped, and Google's /goto?url=<token> wrapper is looked up in the
+token -> destination map the fetcher resolved through Google's own redirect. The
+visible breadcrumb is never used to rebuild a URL - it is often just the domain,
+not the destination. A link that can't be resolved leaves url None and records
+a gap, which fails the page.
 """
 import logging
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
 
 from selectolax.parser import Node
 
-from ..urls import strip_text_fragment, unwrap_google_redirect
-from .misc import clean_prose, clean_text, node_text
+from ..urls import strip_text_fragment
+from .context import ParseContext
+from .misc import clean_prose, clean_text
 
 log = logging.getLogger("serp.parsers.organic")
 
@@ -59,46 +54,17 @@ def _find_container(title_link: Node) -> Node:
     return node  # fallback: whatever we reached (logged by the caller if odd)
 
 
-def _breadcrumb_to_url(cite_text: str) -> str | None:
-    """"https://host.com/ wiki / Page" (Google's '›'-joined breadcrumb) -> a URL.
-    Real visible text, reassembled - not guessed - but can be imprecise if
-    Google only showed the bare domain."""
-    if "›" not in cite_text:
-        return cite_text if cite_text.startswith("http") else None
-    parts = [p.strip() for p in cite_text.split("›")]
-    domain = parts[0].rstrip("/")
-    if not domain.startswith("http"):
-        return None
-    path = "/".join(p.replace(" ", "") for p in parts[1:] if p)
-    return f"{domain}/{path}" if path else domain
-
-
-def _resolve_url(title_link: Node, warnings: list[str]) -> str | None:
-    href = title_link.attributes.get("href") or ""
-    if href.startswith("http://") or href.startswith("https://"):
-        host = (urlsplit(href).hostname or "").lower()
-        if host.endswith("google.com") and urlsplit(href).path == "/url":
-            return unwrap_google_redirect(href)
-        return href
-    if href.startswith("/url?"):
-        return unwrap_google_redirect(href, base="https://www.google.com/")
-    # An opaque redirect (e.g. /goto?url=...) or something else unresolvable -
-    # fall back to the visible cite/breadcrumb text instead of the href.
-    cite = title_link.css_first("cite")
-    if cite is not None:
-        text = clean_text(cite.text(strip=True))
-        if text:
-            url = _breadcrumb_to_url(text)
-            if url:
-                warnings.append(f"used visible cite text for url (href was {href[:40]!r})")
-                return url
-    warnings.append(f"could not resolve a url for this result (href={href[:60]!r})")
-    return None
+def _resolve_url(link: Node, ctx: ParseContext, what: str) -> str | None:
+    href = link.attributes.get("href")
+    url = ctx.links.resolve(href)
+    if url is None:
+        ctx.gap("organic", f"{what}: {ctx.link_problem(href)}")
+    return url
 
 
 def _is_real_sublink(a: Node) -> bool:
     href = a.attributes.get("href") or ""
-    if not href or href.startswith("#") and False:
+    if not href or href.startswith(("#", "javascript:")):
         return False
     aria = (a.attributes.get("aria-label") or "").strip().lower()
     if aria in IGNORE_LINK_ARIA:
@@ -106,8 +72,8 @@ def _is_real_sublink(a: Node) -> bool:
     return bool(a.text(strip=True))
 
 
-def parse_organic_results(rso: Node) -> tuple[list[OrganicResult], list[str]]:
-    warnings: list[str] = []
+def parse_organic_results(rso: Node, ctx: ParseContext | None = None) -> tuple[list[OrganicResult], list[str]]:
+    ctx = ctx if ctx is not None else ParseContext()
     results: list[OrganicResult] = []
     seen_titles_urls: set[tuple[str, str | None]] = set()
 
@@ -117,20 +83,23 @@ def parse_organic_results(rso: Node) -> tuple[list[OrganicResult], list[str]]:
         title = clean_text(h3.text(strip=True))
         if not title:
             continue
-        url = _resolve_url(title_link, warnings)
-        key = (title, url)
+        href = title_link.attributes.get("href")
+        url = ctx.links.resolve(href)
+        key = (title, url or href)
         if key in seen_titles_urls:
             continue  # accessibility duplicate of a result we already have
         seen_titles_urls.add(key)
+        if url is None:
+            ctx.gap("organic", f"result {title[:60]!r}: {ctx.link_problem(href)}")
 
         container = _find_container(title_link)
-        content, sub_links = _parse_body(container, title_link, warnings)
+        content, sub_links = _parse_body(container, title_link, ctx)
         results.append(OrganicResult(url=url, title=title, content=content, sub_links=sub_links))
 
-    return results, warnings
+    return results, ctx.warnings
 
 
-def _parse_body(container: Node, title_link: Node, warnings: list[str]) -> tuple[str | None, list[SubLink]]:
+def _parse_body(container: Node, title_link: Node, ctx: ParseContext) -> tuple[str | None, list[SubLink]]:
     wrapper = title_link
     for _ in range(10):
         if wrapper is None or wrapper is container.parent:
@@ -160,8 +129,9 @@ def _parse_body(container: Node, title_link: Node, warnings: list[str]) -> tuple
             # whole child is still the snippet paragraph.
             if len(links) >= 2 and kid.css_first("h3") is None:
                 for a in links:
-                    sub_url = strip_text_fragment(_resolve_url(a, warnings))
-                    sub_links.append(SubLink(title=clean_text(a.text(strip=True)) or "", url=sub_url))
+                    sub_title = clean_text(a.text(strip=True)) or ""
+                    sub_url = strip_text_fragment(_resolve_url(a, ctx, f"sub-link {sub_title[:40]!r}"))
+                    sub_links.append(SubLink(title=sub_title, url=sub_url))
             else:
                 t = clean_prose(kid.text(separator=" ", strip=True))
                 if t:
@@ -180,6 +150,6 @@ def _parse_body(container: Node, title_link: Node, warnings: list[str]) -> tuple
                 remainder = remainder.replace(junk, " ")
             content = clean_prose(remainder) or None
         if content is None:
-            warnings.append("could not isolate a snippet for this result (unrecognized layout)")
+            ctx.warnings.append("could not isolate a snippet for this result (unrecognized layout)")
 
     return content, sub_links
