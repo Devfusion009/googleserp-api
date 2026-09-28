@@ -25,7 +25,6 @@ dedupe_consecutive() drops the repeat.
 """
 import logging
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
 
 from selectolax.parser import HTMLParser, Node
 
@@ -77,9 +76,11 @@ def _is_heading3(node: Node) -> bool:
     return node.attributes.get("role") == "heading" and node.attributes.get("aria-level") == "3"
 
 
-def _is_google(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
-    return host == "google.com" or host.endswith(".google.com")
+def _is_product_card(link: Node | None, href: str | None) -> bool:
+    """Google's shopping card in the sources panel: no href, role=button and a
+    product cluster id (data-cid). Anything else without a usable link is a
+    citation we failed to resolve."""
+    return link is not None and not href and link.attributes.get("role") == "button" and bool(link.attributes.get("data-cid"))
 
 
 def _parse_sources(root: Node, ctx: ParseContext, warnings: list[str]) -> list[AioSource]:
@@ -88,17 +89,17 @@ def _parse_sources(root: Node, ctx: ParseContext, warnings: list[str]) -> list[A
     for item in root.css(f"li.{SOURCE_ITEM_CLASS}"):
         link = item.css_first(f"a.{SOURCE_LINK_CLASS}")
         href = link.attributes.get("href") if link else None
-        if link is not None and not href and link.attributes.get("role") == "button":
-            # A product card: opens Google's own product viewer in the page and
-            # has no web destination - not listed, like other Google-hosted sources.
-            warnings.append(f"aio product card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r} has no web destination; not listed")
+        if _is_product_card(link, href):
+            # A shopping card: a button that opens Google's product viewer in the
+            # page. It is UI, not a citation - there is no page it cites.
+            warnings.append(f"aio product card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r} is a shopping element, not a citation; not listed")
             continue
+        # Redirect wrappers (/goto, /url?q=) are resolved; a citation of a Google
+        # page (e.g. Google Flights) is a genuine source and stays. A citation
+        # that can't be resolved is a gap, never silently dropped.
         url = strip_text_fragment(ctx.links.resolve(href))
         if not url:
             ctx.gap("ai_overview", f"source card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r}: {ctx.link_problem(href)}")
-            continue
-        if _is_google(url):
-            warnings.append(f"aio source links to Google itself ({url[:60]}); not listed")
             continue
         if url in seen:
             continue

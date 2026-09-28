@@ -92,18 +92,23 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-def _set_debug_headers(resp, request_id: str, classification: str, result=None) -> None:
+def _set_debug_headers(resp, request_id: str, classification: str, result=None, outcome=None) -> None:
     resp.headers["X-Request-Id"] = request_id
     resp.headers["X-Classification"] = classification
+    if outcome is not None:
+        # requests_used plus the breakdown by kind (see app/netwatch.py), all pages.
+        resp.headers["X-Google-Requests"] = json.dumps({"requests_used": outcome.requests_used, **outcome.usage})
     if result is not None:
         resp.headers["X-AIO-State"] = result.aio_state.value
         resp.headers["X-Timings"] = json.dumps(result.timings)
+        if result.session:
+            resp.headers["X-Proxy-Session"] = json.dumps(result.session)
         if result.artifact_dir:
             resp.headers["X-Artifact-Dir"] = result.artifact_dir
 
 
 def _error_response(
-    request_id: str, code: str, message: str, status_code: int, elapsed_ms: int, requests_used: int, result=None
+    request_id: str, code: str, message: str, status_code: int, elapsed_ms: int, requests_used: int, result=None, outcome=None
 ) -> JSONResponse:
     body = SerpResponse(
         status_code=status_code,
@@ -114,7 +119,7 @@ def _error_response(
         error_message=message,
     )
     resp = JSONResponse(status_code=status_code, content=body.model_dump())
-    _set_debug_headers(resp, request_id, code, result)
+    _set_debug_headers(resp, request_id, code, result, outcome)
     return resp
 
 
@@ -139,7 +144,7 @@ async def serp(
 
     if not outcome.ok:
         log.warning("request_id=%s page=%s classification=%s reason=%s", request_id, outcome.failed_page, outcome.error_code, outcome.error_message)
-        return _error_response(request_id, outcome.error_code, outcome.error_message, outcome.status_code, elapsed(), outcome.requests_used, outcome.first)
+        return _error_response(request_id, outcome.error_code, outcome.error_message, outcome.status_code, elapsed(), outcome.requests_used, outcome.first, outcome)
 
     for w in outcome.warnings:
         log.warning("request_id=%s parse warning: %s", request_id, w)
@@ -149,5 +154,5 @@ async def serp(
     else:
         body = SerpResponse(status_code=200, requests_used=outcome.requests_used, elapsed_time=elapsed(), results=outcome.pages)
         resp = JSONResponse(content=body.model_dump())
-    _set_debug_headers(resp, request_id, "ok", outcome.first)
+    _set_debug_headers(resp, request_id, "ok", outcome.first, outcome)
     return resp

@@ -105,6 +105,9 @@ async def test_goto_links_resolve_in_page_and_the_page_is_valid(fake_google, bro
     assert first.timings["links_needed"] == first.timings["links_resolved"] == first.timings["links_in_page"] == 4
     assert first.timings["bytes_in"] > len(PAGE) and first.timings["net_requests"] >= 5
     assert FakeGoogle.image_hits == 0  # BLOCK_RESOURCES really blocked the image
+    # the 4 /goto resolutions are counted from the network, on top of the page load
+    assert first.usage["goto"] == 4
+    assert out.requests_used == first.requests_used == 5 and out.usage["goto"] == 4
 
     page = out.pages[0]
     assert [o.url for o in page.organic] == ["https://dest.example/token_r1", "https://dest.example/token_r2"]

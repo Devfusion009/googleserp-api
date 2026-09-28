@@ -121,15 +121,25 @@ If `API_KEY` is set, add `-H 'X-API-Key: <key>'`. `/health` never needs a key.
 
 On any error `results` is `[]`. With `results > 10`, if any page fails the whole
 request fails (see [Assumptions](#assumptions-to-confirm-with-the-client)).
-`requests_used` counts every Google page load for the call, retries included.
+`requests_used` counts the requests to Google the call cost, on every page:
+page loads (every attempt and redirect hop, so retries count), the `/async/`
+follow-ups the page makes (this is how the AI Overview arrives) and the `/goto`
+link resolutions (4-18 per page on the saved pages). Requests are counted from
+the browser's network events once they got an answer or failed on the network;
+resources the blocker stopped never left the browser and aren't counted.
+Scripts, styles and logging pings to Google hosts are not in `requests_used`
+but are reported in `X-Google-Requests`.
 
 **Debug headers** (never in the JSON body): `X-Request-Id`, `X-Classification`,
 `X-AIO-State` (`absent` / `complete` / `incomplete`), `X-Timings` (JSON: `nav_ms`,
 `results_ms`, `aio_ms`, `links_ms`, `total_ms`, `attempt`; `links_needed` /
 `links_resolved` / `links_in_page` for `/goto` resolution; `bytes_in` and
 `net_requests` - bytes received over the network and requests made for the
-page), `X-Artifact-Dir` (saved HTML + screenshot for this request, when
-`DEBUG_ARTIFACTS=true`).
+page), `X-Google-Requests` (JSON: `requests_used` and every request by kind -
+`document`, `async`, `goto`, `goto_fallback`, `other_google`, `non_google`),
+`X-Proxy-Session` (JSON: the proxy `session` id, `exit_ip` before and
+`exit_ip_after` the request, `ip_changed`), `X-Artifact-Dir` (saved HTML +
+screenshot for this request, when `DEBUG_ARTIFACTS=true`).
 
 ## Configuration
 
@@ -139,11 +149,11 @@ All settings come from `.env` (see `.env.example`) or environment variables.
 |---|---|---|
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | where `run.py` listens (also the benchmark's default target) |
 | `API_KEY` | empty | if set, `POST /serp` requires `X-API-Key: <value>` |
-| `HEADLESS` | `false` | `true` for servers without a display |
+| `HEADLESS` | `false` | `true` for servers without a display, and for proxy runs: it uses Playwright's headless shell, which makes no requests of its own. The full browser (`false`, or `BROWSER_CHANNEL=chrome`) contacts Google by itself (sign-in check, network time, `/async/folae`), one of them through the page's proxy. |
 | `BROWSER_CHANNEL` | `chromium` | `chromium` (Playwright's bundled build) or `chrome` (installed Google Chrome). No stealth/fingerprint patches either way. |
 | `BROWSER_EXECUTABLE_PATH` | empty | use a Chromium binary at this path instead of Playwright's own download |
 | `CONCURRENCY` | `1` | number of browser pages kept open and used in parallel |
-| `BLOCK_RESOURCES` | `true` | skip images, media and fonts (scripts and stylesheets are never blocked - the AI Overview needs them) |
+| `BLOCK_RESOURCES` | `true` | skip images, media and fonts (scripts and stylesheets are never blocked - the AI Overview needs them). Blocking uses request routing, which turns off the browser's HTTP cache: every page downloads Google's scripts again (see [Known limitations](#known-limitations)). |
 | `NAV_TIMEOUT_MS` | `15000` | navigation timeout, and max wait for the results container |
 | `AIO_APPEAR_WAIT_MS` | `1500` | how long to wait for an AI Overview to appear once results are visible |
 | `AIO_MAX_WAIT_MS` | `8000` | max time for a present AI Overview to finish loading and expand; beyond this -> `aio_incomplete` |
@@ -157,6 +167,10 @@ All settings come from `.env` (see `.env.example`) or environment variables.
 | `PROXY_MODE` | `none` | `none`, `static` or `list` |
 | `PROXY_URL` | empty | for `static`: `http://user:pass@host:port` |
 | `PROXY_LIST_FILE` | empty | for `list`: file with one proxy URL per line, used round-robin |
+| `PROXY_SESSION_MAX_SECONDS` | `0` | start a new proxy session (new browser context) before a request once the current one is this old; set it below the provider's shortest session lifetime. `0` = no age limit |
+| `EXIT_IP_CHECK_URL` | empty | optional URL that answers with the caller's IP, requested through the slot's proxy before and after each request to detect exit-IP changes (a few hundred bytes each; not a Google request) |
+| `EXIT_IP_CHECK_TIMEOUT_MS` | `5000` | timeout for that check; a failed check counts as "unknown", never as a change |
+| `TRAFFIC_BUDGET_MB` | `0` | default for the benchmark's `--traffic-budget-mb` |
 | `DEBUG_ARTIFACTS` | `true` | save every page's HTML + full-page screenshot to `ARTIFACTS_DIR/<timestamp>_<query>/` |
 | `ARTIFACTS_DIR` | `artifacts` | where artifacts go (git-ignored) |
 
@@ -180,14 +194,31 @@ providers that select the exit country through the username. Credentials are
 masked in logs (`http://use***@host:port`); every request logs which (masked)
 proxy it used.
 
-**Sticky sessions are required.** Everything for one page - the search, its
+**Sticky sessions and IP changes.** Everything for one page - the search, its
 scripts, the AI Overview's follow-up requests and the `/goto` resolutions -
-must leave from the same IP as the cookies Google set, so the proxy URL must pin
-a session (usually a session id in the username) for longer than a request
-takes; 10-30 minutes lets one browser context stay warm (cookies, cached
-scripts) across many requests. `static` uses one session for every slot.
-`list` rotates per request and rebuilds the browser context each time, so every
-request starts with a cold cache (more traffic per page).
+should leave from one IP, the one Google set its cookies on. A request takes a
+few seconds, so a session only has to hold for that long; how long it lasts
+beyond that doesn't matter for correctness. A browser context is tied to one
+proxy session and never carried to another:
+
+- A literal `{session}` in `PROXY_URL` (or a list line) is replaced with a fresh
+  random id every time a browser context is built, e.g.
+  `http://USER-session-{session}:PASS@host:port` (use the provider's own
+  session syntax). Every context is its own sticky session.
+- The context - and so the session - is replaced only **between** requests,
+  never during one: after a CAPTCHA or consent page, when it is older than
+  `PROXY_SESSION_MAX_SECONDS`, after a browser/network error, or when the exit
+  IP moved.
+- With `EXIT_IP_CHECK_URL`, the exit IP is read through the slot's proxy before
+  and after each request. Changed while idle: a fresh session before the
+  request, so cookies never follow a new IP. Changed during a request: the
+  request is kept and judged on what Google returned (a page broken by the
+  switch fails like any other and is not retried); the change is recorded in
+  `X-Proxy-Session` and the benchmark report, and the next request gets a fresh
+  session.
+
+`static` uses one session template for every slot; `list` rotates per request
+and rebuilds the browser context each time.
 
 ## Benchmark
 
@@ -201,7 +232,8 @@ Start the API, then in a second terminal:
 
 Options: `--corpus mixed|difficult|both`, `--repeat N`, `--limit N`,
 `--concurrency N` (default 1), `--min-delay S` (default `MIN_DELAY_SECONDS`),
-`--allow-more`, `--base-url`, `--api-key`.
+`--traffic-budget-mb MB` (default `TRAFFIC_BUDGET_MB`), `--allow-more`,
+`--base-url`, `--api-key`.
 
 It calls the API over HTTP exactly like the client will and measures
 client-side wall-clock time per request. Each run writes
@@ -209,8 +241,18 @@ client-side wall-clock time per request. Each run writes
 valid-result rate with counts per classification; P50 / P95 / max latency over
 **all** requests including failures (nearest-rank), with PASS/FAIL against
 >= 98% and <= 2000 ms; AI Overview appeared/complete/average sources per query;
-average stage timings; top failure reasons with artifact paths. Every local
-report is labelled as not representative of the US-proxy test.
+average stage timings; traffic per page and for the run; Google requests
+(`requests_used` total and every request by kind); proxy sessions, exit IPs
+and requests with an IP change; top failure reasons with artifact paths. Runs
+without a proxy are labelled as not representative of the US-proxy test.
+
+A run that stops early - at the first CAPTCHA (`STOP_ON_BLOCK`) or before the
+traffic budget would be passed - still reports the request that stopped it,
+lists every query that was **not executed**, and says the figures don't
+establish success rates. The budget check stops before one more page (the
+largest measured so far) could take measured traffic past 70% of the budget:
+the browser's counter misses upload and TLS overhead, so the proxy provider's
+figure is higher.
 
 The corpora are `bench/corpora/mixed.txt` (15 queries, US/English) and
 `bench/corpora/difficult.txt` (the difficult URL, byte-for-byte).
@@ -221,8 +263,9 @@ The corpora are `bench/corpora/mixed.txt` (15 queries, US/English) and
 .venv/bin/python -m pytest
 ```
 
-154 tests, none touching Google (2 of them need a local Chromium and are
-skipped without one):
+168 tests, none touching Google (2 of them need a local Chromium and are
+skipped without one; point `BROWSER_EXECUTABLE_PATH` at a headless shell - the
+full browser contacts Google by itself, see `HEADLESS`):
 
 - `test_pipeline.py` - **classification and parsing together** on the 16 real
   saved pages: each goes through `classify_page`, the fetcher's `/goto` token
@@ -240,8 +283,12 @@ skipped without one):
   Fetcher + run_serp, resource blocking on) in a real Chromium against a local
   stand-in for Google: `/goto` links resolved in the page through CDP,
   stylesheet-hidden failure templates ignored, images blocked, bytes counted,
-  `/sorry/` -> `blocked_captcha`. Skipped if no Chromium can be launched (set
-  `BROWSER_EXECUTABLE_PATH` if Playwright's own build isn't installed).
+  `/goto` requests counted in `requests_used`, `/sorry/` -> `blocked_captcha`.
+  Skipped if no Chromium can be launched.
+- `test_browser_sessions.py` - proxy sessions with a fake browser: a fresh
+  `{session}` id per context, rotation by age and after a CAPTCHA, an exit-IP
+  change while idle (new session first) and during a request (recorded, new
+  session next).
 - URL rules and pass-through (the difficult URL reaches the browser
   byte-for-byte), the classifier on the real CAPTCHA page, the API with the
   fetcher mocked, and the benchmark's maths and stop rules.
@@ -339,12 +386,14 @@ top to bottom with these rules:
 - **sources**: every card in the sources panel (`li.h7wxwc`), including the ones
   only visible after "Show all" (the fetcher clicks "Show more" and "Show all"
   first). Each card gives `title`, `url` (the card link's real destination,
-  resolved from `/goto` when wrapped) and `snippet`. URLs are de-duplicated,
-  `#:~:text=` fragments are stripped, and `google.com` links are dropped.
-  Product cards (a `role="button"` card that opens Google's product viewer in
-  the page) have no web destination and are not listed either. A card whose
-  destination can't be resolved, or an AI Overview with no source cards at all,
-  makes the request `aio_incomplete`.
+  resolved from `/goto` or `/url?q=` when wrapped) and `snippet`. URLs are
+  de-duplicated and `#:~:text=` fragments are stripped. A citation of a Google
+  page (e.g. Google Flights) is a genuine source and is kept. Shopping cards -
+  no link, `role="button"` and a product id (`data-cid`), opening Google's
+  product viewer in the page - are UI rather than citations and are not listed.
+  A citation whose destination can't be resolved is never dropped: the request
+  becomes `aio_incomplete`, and so does an AI Overview with no source cards at
+  all.
 
 **Knowledge panel** - from `#rhs`: `title` and `subtitle` from the panel header,
 `description` and `source_url` from the `description` block (the attribution
@@ -373,21 +422,35 @@ extract completely; any gap fails the page:
 | gap | error |
 |---|---|
 | an organic result, sitelink or ad whose destination is unknown (e.g. a `/goto` link that didn't resolve) | `parse_error` - "incomplete extraction - N incomplete result links: ..." |
-| an AI Overview source card whose destination is unknown, or an AI Overview with no source cards | `aio_incomplete` - "incomplete extraction - N incomplete AI Overview: ..." |
+| an AI Overview citation whose destination is unknown, an AI Overview with no source cards, or AI Overview text that couldn't be read | `aio_incomplete` - "incomplete extraction - N incomplete AI Overview: ..." |
 
 The message names the first few items. A page with zero organic results is
 still `degraded_page` first.
 
+## Decisions confirmed by the client
+
+- Shopping/product cards that only open Google's product viewer are excluded
+  from AI Overview `sources` (they are UI, not citations).
+- Sources are not excluded for pointing at Google: redirect wrappers are
+  resolved, genuine Google-hosted citations stay, and a citation that can't be
+  resolved makes the request incomplete instead of being dropped.
+- `/goto` link resolutions count in Google request usage (`requests_used`),
+  with retries and AI Overview follow-ups.
+- The first live run is a single-session smoke test that stops at the first
+  CAPTCHA; its report includes that failure and the queries not executed, and
+  it does not establish benchmark success rates.
+
 ## Assumptions to confirm with the client
 
 1. **Unresolved links fail the page.** A result/sitelink/ad whose destination
-   can't be resolved is reported as `parse_error` (and an AI Overview source as
-   `aio_incomplete`) - the closest codes in the agreed list. A dedicated code
+   can't be resolved is reported as `parse_error` (and an AI Overview citation
+   as `aio_incomplete`) - the closest codes in the agreed list. A dedicated code
    (e.g. `incomplete_result`) can be added if preferred. The breadcrumb is no
    longer used to rebuild URLs.
-2. **Sources that aren't web pages** - AI Overview source cards pointing at
-   Google itself (e.g. Google Flights) and product cards that open Google's
-   product viewer - are left out of `sources` rather than failing the page.
+2. **What `requests_used` counts** - page loads (retries and redirect hops
+   included), `/async/` follow-ups and `/goto` resolutions; not the page's
+   scripts, styles and logging pings, which are listed separately in
+   `X-Google-Requests`.
 3. **Partial pages.** With `results > 10`, if page 1 succeeds and page 2 is
    blocked, we return the error with `results: []` (per "results: [] on error"),
    discarding page 1. Alternative: return successful pages plus an error flag.
@@ -419,6 +482,19 @@ still `degraded_page` first.
   the page's existing connection; whether that changes the block rate is one of
   the things the first proxy run measures (`X-Timings` `links_*`, report
   "Traffic" section).
+- **Every page is a cold load while `BLOCK_RESOURCES=true`.** Blocking uses
+  Playwright request routing, and routing turns off the browser's HTTP cache
+  (verified: a script cacheable for a year was downloaded on each of 3 page
+  loads with routing, once without). So each page downloads Google's scripts
+  again. Blocking images and fonts in a way that keeps the cache (browser
+  switches instead of routing) is the first traffic optimization to try once
+  the smoke test has measured real page sizes.
+- **The full browser contacts Google by itself.** Headed Chromium or Chrome
+  (`HEADLESS=false`, `BROWSER_CHANNEL=chrome`) makes its own requests to Google
+  (`accounts.google.com/ListAccounts`, `www.google.com/async/folae`, network
+  time, device check-in, DNS-over-HTTPS) - one of them through the page's
+  proxy, outside the page's request counters. Playwright's headless shell
+  (`HEADLESS=true`) makes none; use it for proxy runs.
 - **Saved `/goto` pages can't be fully checked offline.** 6 of the 16 fixtures
   (apple, best_cell_phone_plans, chase_bank_login, mobile, t_mobile, wikipedia)
   use `/goto`; their destinations were never captured, so offline they fail as
@@ -437,10 +513,30 @@ still `degraded_page` first.
 
 ## What's still needed to reach the targets (>= 98% valid, P95 <= 2 s per corpus)
 
-1. **Run through the client's US residential proxies.** Set `PROXY_MODE` and
-   run the benchmark (start small: `--limit 3`, then the full corpora). This is
-   the first real measurement of block rate, latency, traffic per page and
-   `/goto` resolution on Google's servers.
+1. **Single-session smoke test through the client's proxy** (100 MB allocated).
+   It is the first real measurement of traffic per page, Google requests per
+   page, `/goto` resolution on Google's servers and whether the page blocks;
+   it does not establish success rates.
+
+   ```ini
+   HEADLESS=true                      # headless shell: no requests of its own
+   CONCURRENCY=1
+   PROXY_MODE=static
+   PROXY_URL=http://USER-session-{session}:PASS@HOST:PORT   # provider's session syntax
+   PROXY_SESSION_MAX_SECONDS=...      # below the shortest session lifetime they give
+   EXIT_IP_CHECK_URL=...              # if the provider offers one through the proxy
+   TRAFFIC_BUDGET_MB=100
+   STOP_ON_BLOCK=true
+   ```
+
+   ```bash
+   .venv/bin/python bench/run_bench.py --corpus mixed --limit 3   # 3 requests; check the report
+   .venv/bin/python bench/run_bench.py --corpus both --repeat 1   # 15 mixed + 1 difficult
+   .venv/bin/python bench/run_bench.py --corpus difficult --repeat 4
+   ```
+
+   At most 23 page loads, 10 s apart. Every report lists what didn't run and
+   why (first CAPTCHA, or the traffic budget).
 2. **Confirm the AI Overview wait logic on live pages.** Check `X-AIO-State` and
    the saved screenshots for queries known to have an AI Overview; tune
    `AIO_APPEAR_WAIT_MS` / `AIO_MAX_WAIT_MS` and the loading signals.

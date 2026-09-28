@@ -57,6 +57,7 @@ class GotoResolution:
     blocked: bool = False
     in_page: int = 0
     fallback: int = 0
+    fallback_requests: int = 0  # sent outside the page, so the CDP counters don't see them
 
 
 async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], s: Settings) -> GotoResolution:
@@ -93,6 +94,7 @@ async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], 
 
         async def one(token: str) -> None:
             async with gate:
+                out.fallback_requests += 1
                 try:
                     resp = await page.context.request.get(urls[token], max_redirects=0, timeout=s.goto_timeout_ms)
                 except PlaywrightError as e:

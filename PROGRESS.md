@@ -275,3 +275,44 @@ and asked what "working end-to-end" covers. No live requests to Google in this p
 - `/goto` resolution against Google itself (the mechanism is from public
   measurements; ours is a local simulation), and whether the extra 4-18 small
   requests per page change the block rate.
+
+## Phase 8 - Client decisions + smoke-test prep (offline) - DONE
+
+Client answers (2026-09-28): product/shopping cards may be excluded; sources must
+not be dropped for pointing at Google (resolve redirects, keep genuine Google
+citations, unresolved = incomplete); smoke test may stop at the first CAPTCHA
+but must report that failure and the unexecuted queries; sessions can't
+guarantee one IP for 10-30 min; /goto resolutions must count in Google request
+usage with retries and AI Overview follow-ups; 100 MB for a single-session test.
+
+### Changed
+- AIO sources: Google-hosted citations kept (flights page now lists Google
+  Flights); only shopping cards (no href + role=button + data-cid) are
+  skipped; any other linkless/unresolved card is an `aio_incomplete` gap.
+- `requests_used` = page loads (each attempt and redirect hop) + `/async/`
+  follow-ups + `/goto` resolutions (in page, counted from CDP once answered, and
+  fallback ones counted by the resolver), summed over retries and pages.
+  `X-Google-Requests` gives the breakdown incl. `other_google` / `non_google`.
+  Found while testing: counting at `loadingFinished` missed a /goto whose event
+  trailed; now counted when response headers arrive.
+- Proxy sessions: `{session}` placeholder -> fresh id per browser context;
+  context replaced only between requests (CAPTCHA/consent, age >
+  `PROXY_SESSION_MAX_SECONDS`, network error, exit-IP change); optional
+  `EXIT_IP_CHECK_URL` before/after each request; `X-Proxy-Session`.
+- Benchmark: "Not executed" list, early-stop caveat, `--traffic-budget-mb`
+  (stops before one more page could pass 70% of the budget), Google request
+  and session/IP sections.
+
+### Found (verified locally)
+- Playwright request routing (our BLOCK_RESOURCES) disables the HTTP cache:
+  every page re-downloads Google's scripts. The earlier "0.3-0.8 MB after the
+  first page" estimate was wrong; every page is a cold load. Cache-preserving
+  blocking is the first optimization after the smoke test measures page size.
+- Full Chromium (headed / chrome channel) makes its own Google requests
+  (ListAccounts, /async/folae, network time, checkin, DoH); one went through
+  the context proxy even with a dead launch-level proxy. The headless shell
+  makes none -> HEADLESS=true for proxy runs and tests. This was also the source
+  of www.google.com CONNECTs seen from test_browser_local when it ran on the
+  full binary.
+
+Tests: 168 (2 need a local Chromium).

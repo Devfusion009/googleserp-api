@@ -40,6 +40,10 @@ LOCAL_LABEL = (
     "representative of the client's US-proxy test."
 )
 PROXY_LABEL = "Run through proxies (PROXY_MODE={mode})."
+# The browser's byte counter misses upload, TLS overhead and the few requests made
+# outside the page, so a traffic budget is only spent up to this share.
+BUDGET_SAFETY_SHARE = 0.7
+FIRST_PAGE_RESERVE_MB = 3.0  # assumed size of a page before any has been measured
 STAGES = ("nav_ms", "results_ms", "aio_ms", "links_ms", "total_ms")
 
 
@@ -55,6 +59,9 @@ class Call:
     timings: dict = field(default_factory=dict)
     error_message: str | None = None
     artifact_dir: str | None = None
+    requests_used: int | None = None
+    google_requests: dict = field(default_factory=dict)  # X-Google-Requests breakdown
+    session: dict = field(default_factory=dict)  # X-Proxy-Session
 
 
 def load_corpus(name: str) -> list[str]:
@@ -96,10 +103,14 @@ async def call_api(client: httpx.AsyncClient, base_url: str, api_key: str | None
     except ValueError:
         data = None
     classification = resp.headers.get("X-Classification") or ("ok" if resp.status_code == 200 else "unknown")
-    try:
-        timings = json.loads(resp.headers.get("X-Timings") or "{}")
-    except ValueError:
-        timings = {}
+
+    def header_json(name: str) -> dict:
+        try:
+            return json.loads(resp.headers.get(name) or "{}")
+        except ValueError:
+            return {}
+
+    timings = header_json("X-Timings")
     sources = None
     if data and data.get("results"):
         aio = data["results"][0].get("ai_overview")
@@ -116,6 +127,9 @@ async def call_api(client: httpx.AsyncClient, base_url: str, api_key: str | None
             timings=timings,
             error_message=(data or {}).get("error_message"),
             artifact_dir=resp.headers.get("X-Artifact-Dir"),
+            requests_used=(data or {}).get("requests_used"),
+            google_requests=header_json("X-Google-Requests"),
+            session=header_json("X-Proxy-Session"),
         ),
         data,
     )
@@ -162,6 +176,17 @@ def summarize(calls: list[Call]) -> dict:
         "links_unresolved": sum(needed) - sum(resolved) if needed else None,
     }
 
+    google = Counter()
+    for c in calls:
+        google.update({k: v for k, v in c.google_requests.items() if k != "requests_used" and isinstance(v, int)})
+    usage = {
+        "requests_used": sum(c.requests_used or 0 for c in calls),
+        "by_kind": dict(google),
+        "sessions": len({c.session.get("session") for c in calls if c.session.get("session")}),
+        "exit_ips": len({ip for c in calls for ip in (c.session.get("exit_ip"), c.session.get("exit_ip_after")) if ip}),
+        "ip_changed_during_request": sum(1 for c in calls if c.session.get("ip_changed")),
+    }
+
     failures = Counter((c.classification, c.error_message or "") for c in calls if c.classification != "ok")
     failure_artifacts = defaultdict(list)
     for c in calls:
@@ -181,21 +206,34 @@ def summarize(calls: list[Call]) -> dict:
         "per_query": per_query,
         "stage_avgs": stage_avgs,
         "traffic": traffic,
+        "usage": usage,
         "failures": failures.most_common(),
         "failure_artifacts": failure_artifacts,
     }
 
 
-def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, dict], stopped_reason: str | None) -> str:
+def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, dict], stopped_reason: str | None,
+                  not_run: list[tuple[str, str]] | None = None) -> str:
     mode = get_settings().proxy_mode
     label = LOCAL_LABEL if mode == "none" else PROXY_LABEL.format(mode=mode)
     lines = [f"# Benchmark report `{run_id}`", "", f"> **{label}**", ""]
+    budget = getattr(args, "traffic_budget_mb", 0) or 0
     lines += [
-        f"- Corpus: `{args.corpus}`, repeat {args.repeat}, limit {args.limit or '-'}, concurrency {args.concurrency}, min delay {args.min_delay}s",
+        f"- Corpus: `{args.corpus}`, repeat {args.repeat}, limit {args.limit or '-'}, concurrency {args.concurrency}, min delay {args.min_delay}s"
+        + (f", traffic budget {budget:g} MB" if budget else ""),
         f"- Targets (per corpus): valid >= {TARGET_VALID_RATE:.0%}, P95 <= {TARGET_P95_MS} ms",
     ]
     if stopped_reason:
-        lines += ["", f"**Run stopped early:** {stopped_reason}"]
+        lines += [
+            "",
+            f"**Run stopped early:** {stopped_reason}",
+            "",
+            "_The figures below cover only the requests that ran (the stopping request included). "
+            "They don't establish benchmark success rates._",
+        ]
+    if not_run:
+        lines += ["", f"### Not executed ({len(not_run)})", ""]
+        lines += [f"- {corpus}: `{url}`" for corpus, url in not_run]
     for name, s in by_corpus.items():
         pf = lambda ok: "PASS" if ok else "FAIL"  # noqa: E731
         lines += ["", f"## Corpus: {name}", ""]
@@ -226,6 +264,18 @@ def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, di
             f"/goto links resolved per page (avg): {t['avg_links_needed'] if t['avg_links_needed'] is not None else '-'}, "
             f"left unresolved in total: {t['links_unresolved'] if t['links_unresolved'] is not None else '-'}",
             "- Excludes upload (request headers, roughly 0.5-1 KB per request) and TLS overhead; the proxy provider's usage figure is authoritative.",
+        ]
+        u = s["usage"]
+        kinds = ", ".join(f"{k}={v}" for k, v in sorted(u["by_kind"].items())) or "-"
+        lines += [
+            "",
+            "### Google requests and proxy sessions",
+            "",
+            f"- `requests_used` total: **{u['requests_used']}** - page loads (every attempt and redirect hop, so retries count), "
+            "`/async/` follow-ups (the AI Overview loads this way) and `/goto` link resolutions",
+            f"- All network requests by kind: {kinds} (`other_google` = scripts, styles, logging pings - not in `requests_used`)",
+            f"- Proxy sessions used: {u['sessions'] or '-'}; distinct exit IPs seen: {u['exit_ips'] or '-'}; "
+            f"requests with an exit-IP change during the request: {u['ip_changed_during_request']}",
         ]
         lines += ["", "### AI Overview per query", "", "| query URL | runs | appeared | complete | avg sources |", "|---|---|---|---|---|"]
         for url, q in s["per_query"].items():
@@ -260,11 +310,21 @@ async def run(args: argparse.Namespace) -> int:
     responses_path = out_dir / "responses.jsonl"
 
     calls: list[Call] = []
+    started: set[int] = set()
     stopped_reason: str | None = None
     stop = asyncio.Event()
     sem = asyncio.Semaphore(max(1, args.concurrency))
     start_lock = asyncio.Lock()
     last_start = [0.0]
+
+    def over_budget() -> bool:
+        """True when one more page could push measured traffic past the safety
+        share of the budget (the browser counter misses upload and TLS overhead)."""
+        if not args.traffic_budget_mb:
+            return False
+        pages = [c.timings.get("bytes_in", 0) / 1024 / 1024 for c in calls]
+        reserve = max(pages) if pages else FIRST_PAGE_RESERVE_MB
+        return sum(pages) + reserve > args.traffic_budget_mb * BUDGET_SAFETY_SHARE
 
     async with httpx.AsyncClient(timeout=args.timeout) as client:
 
@@ -279,6 +339,12 @@ async def run(args: argparse.Namespace) -> int:
                         await asyncio.sleep(wait)
                     if stop.is_set():
                         return
+                    if over_budget():
+                        stopped_reason = (f"traffic budget: measured traffic would pass {BUDGET_SAFETY_SHARE:.0%} of "
+                                          f"{args.traffic_budget_mb:g} MB with one more page")
+                        stop.set()
+                        return
+                    started.add(i)
                     last_start[0] = time.monotonic()
                 call, data = await call_api(client, args.base_url, args.api_key, corpus, url)
                 # measure the next gap from when this one *finished* too, so a
@@ -302,7 +368,8 @@ async def run(args: argparse.Namespace) -> int:
         if subset:
             by_corpus[name] = summarize(subset)
 
-    report = render_report(run_id, args, by_corpus, stopped_reason)
+    not_run = [job for i, job in enumerate(jobs) if i not in started]
+    report = render_report(run_id, args, by_corpus, stopped_reason, not_run)
     (out_dir / "report.md").write_text(report, encoding="utf-8")
     print()
     print(report)
@@ -324,6 +391,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--base-url", default=f"http://{s.host}:{s.port}")
     ap.add_argument("--api-key", default=s.api_key or None)
     ap.add_argument("--timeout", type=float, default=60.0, help="per-request HTTP timeout, seconds")
+    ap.add_argument("--traffic-budget-mb", type=float, default=s.traffic_budget_mb,
+                    help="stop before measured proxy traffic could pass 70%% of this (0 = no budget)")
     return ap.parse_args(argv)
 
 
