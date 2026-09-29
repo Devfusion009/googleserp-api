@@ -21,7 +21,7 @@ from selectolax.parser import HTMLParser
 from .browser import PagePool, PageSlot
 from .classify import HIDDEN_MARK, AioState, Classification, classify_page
 from .config import Settings
-from .goto_resolver import resolve_goto
+from .goto_resolver import GotoResolution, resolve_goto
 from .parsers.registry import goto_tokens_needed
 
 log = logging.getLogger("serp.fetcher")
@@ -41,20 +41,66 @@ _AIO_ROOT_JS = r"""
   };
 """
 
+# Expand controls of the AI Overview. After expanding, Google keeps the "Show
+# all" element in the DOM (hidden) next to a "Show less" (seen in every saved
+# page), so a control's presence says nothing - its visibility, label and
+# aria-expanded do.
+EXPAND_LABELS = ("show more", "show all")
+
+# Each expand control gets a stable id (data-serp-btn) the first time it is
+# seen and keeps it, so a click can be verified on the same element even after
+# its label changes ("Show more" -> "Show less") or it is hidden.
 AIO_PROBE_JS = r"""
 () => {""" + _AIO_ROOT_JS + r"""
   const node = aioRoot();
   if (!node) return {present: false};
   const text = (node.innerText || '').trim();
   const busy = !!node.querySelector('[aria-busy=true],[role=progressbar]');
-  const clickable = [...node.querySelectorAll('[role=button],button')]
-    .filter(b => !b.closest('a[href]') && !b.hasAttribute('href'))
-    .filter(b => b.offsetParent !== null)
-    .filter(b => ['show more', 'show all'].includes((b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase()));
-  clickable.forEach((b, i) => b.setAttribute('data-serp-click', String(i)));
-  return {present: true, len: text.length, busy, buttons: clickable.map(b => (b.innerText || b.getAttribute('aria-label')).trim())};
+  const shown = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true}) : el.offsetParent !== null;
+  const labelOf = el => (el.innerText || el.getAttribute('aria-label') || '').trim();
+  const buttons = [];
+  for (const b of node.querySelectorAll('[role=button],button,[data-serp-btn]')) {
+    if (b.closest('a[href]') || b.hasAttribute('href')) continue;
+    const label = labelOf(b);
+    if (!b.hasAttribute('data-serp-btn')) {
+      if (!['show more', 'show all'].includes(label.toLowerCase())) continue;
+      window.__serpBtnSeq = (window.__serpBtnSeq || 0) + 1;
+      b.setAttribute('data-serp-btn', String(window.__serpBtnSeq));
+    }
+    buttons.push({id: b.getAttribute('data-serp-btn'), label, visible: shown(b), expanded: b.getAttribute('aria-expanded')});
+  }
+  return {present: true, len: text.length, busy, buttons};
 }
 """
+
+# A click is retried at most this often, and must show its effect within
+# EXPAND_VERIFY_MS (all within AIO_MAX_WAIT_MS).
+MAX_EXPAND_ATTEMPTS = 3
+EXPAND_VERIFY_MS = 1500
+CLICK_TIMEOUT_MS = 1000
+STABLE_S = 0.3
+
+
+def _pending_expanders(probe: dict, done: set[str]) -> list[dict]:
+    """Visible 'Show more' / 'Show all' controls not yet expanded."""
+    return [
+        b for b in probe["buttons"]
+        if b["visible"] and b["label"].lower() in EXPAND_LABELS and b.get("expanded") != "true" and b["id"] not in done
+    ]
+
+
+def _expansion_seen(before: dict, probe: dict) -> bool:
+    """Did clicking `before` (a button from the previous probe) visibly expand
+    something? The control is gone or hidden, its label changed (e.g. to "Show
+    less"), aria-expanded turned true, or the AI Overview's text grew."""
+    if not probe.get("present"):
+        return False
+    after = next((b for b in probe["buttons"] if b["id"] == before["id"]), None)
+    if after is None or not after["visible"]:
+        return True
+    if after["label"].lower() != before["label"].lower() or after.get("expanded") == "true":
+        return True
+    return probe["len"] > before["len_before"]
 
 # Stamps classify.HIDDEN_MARK on the outermost unrendered elements inside the AI
 # Overview, so the saved HTML says what the browser actually hid - including
@@ -88,8 +134,10 @@ class FetchResult:
     links: dict[str, str] = field(default_factory=dict)  # /goto token -> destination
     # Requests by kind (netwatch.REQUEST_KINDS, plus goto_fallback), summed over retries.
     usage: dict[str, int] = field(default_factory=dict)
-    # Proxy session facts for this request: session id, exit_ip, exit_ip_after, ip_changed.
+    # Proxy session facts for this request: session id, exit_ip, exit_ip_after,
+    # ip_changed, ip_checks / ip_check_bytes.
     session: dict = field(default_factory=dict)
+    goto: GotoResolution | None = None  # /goto resolution for this page, if any
 
     @property
     def requests_used(self) -> int:
@@ -106,6 +154,26 @@ def _ms(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
 
 
+# Summed over retries by Fetcher.fetch.
+TRAFFIC_KEYS = ("bytes_in", "net_requests", "out_of_page_requests", "bytes_out_of_page")
+
+
+def _add_out_of_page_traffic(res: FetchResult) -> None:
+    """Fold the traffic of requests made outside the browser - /goto fallback
+    requests and exit-IP checks - into bytes_in. The browser's counter can't see
+    them; their responses are reconstructed (netwatch.out_of_page_bytes), but
+    their connection/TLS overhead can't be measured, so the figure is marked
+    partial and consumers add an allowance per request."""
+    requests = res.usage.get("goto_fallback", 0) + res.session.get("ip_checks", 0)
+    if not requests:
+        return
+    nbytes = (res.goto.fallback_bytes if res.goto else 0) + res.session.get("ip_check_bytes", 0)
+    res.timings["out_of_page_requests"] = requests
+    res.timings["bytes_out_of_page"] = nbytes
+    res.timings["bytes_in"] = res.timings.get("bytes_in", 0) + nbytes
+    res.timings["bytes_in_partial"] = True
+
+
 def _slug(url: str) -> str:
     m = re.search(r"[?&]q=([^&#]*)", url)
     return re.sub(r"[^a-z0-9]+", "_", (m.group(1) if m else "page").lower().replace("%20", " "))[:50].strip("_")
@@ -120,12 +188,13 @@ class Fetcher:
         attempts = 1 + max(0, self.s.max_retries)
         result = None
         usage: Counter = Counter()
-        bytes_in = 0
-        ip_changed = False
+        traffic: Counter = Counter()
+        partial = ip_changed = False
         for attempt in range(attempts):
             result = await self._fetch_once(url, country, language)
             usage.update(result.usage)
-            bytes_in += result.timings.get("bytes_in", 0)
+            traffic.update({k: result.timings[k] for k in TRAFFIC_KEYS if k in result.timings})
+            partial = partial or bool(result.timings.get("bytes_in_partial"))
             ip_changed = ip_changed or bool(result.session.get("ip_changed"))
             result.timings["attempt"] = attempt + 1
             if result.classification not in (Classification.timeout, Classification.network_error):
@@ -133,8 +202,9 @@ class Fetcher:
             log.warning("retryable failure %s (attempt %d/%d)", result.classification.value, attempt + 1, attempts)
         # A retry costs requests and traffic too: report the totals, not the last attempt's.
         result.usage = dict(usage)
-        if "bytes_in" in result.timings:
-            result.timings["bytes_in"] = bytes_in
+        result.timings.update(traffic)
+        if partial:
+            result.timings["bytes_in_partial"] = True
         if ip_changed:
             result.session["ip_changed"] = True
         return result
@@ -158,12 +228,15 @@ class Fetcher:
                         res.usage.update({k: v for k, v in net.kinds.items() if v})
                     else:
                         res.usage.setdefault("document", 1)
+                    if res.goto is not None and res.goto.fallback_requests:
+                        res.usage["goto_fallback"] = res.goto.fallback_requests
                 if res.classification in (Classification.blocked_captcha, Classification.consent_wall) and hasattr(slot, "retire"):
                     slot.retire = f"Google answered {res.classification.value} on this session"
         except (asyncio.TimeoutError, PlaywrightTimeout) as e:
             res.classification, res.reason = Classification.timeout, f"timed out: {str(e)[:200] or 'request deadline'}"
         except PlaywrightError as e:
             res.classification, res.reason = Classification.network_error, f"browser/network error: {str(e).splitlines()[0][:200]}"
+        _add_out_of_page_traffic(res)
         res.timings["total_ms"] = _ms(t0)
         log.info("done url=%s class=%s aio=%s reason=%s timings=%s",
                  url, res.classification.value, res.aio_state.value, res.reason, res.timings)
@@ -216,13 +289,13 @@ class Fetcher:
         res.timings["links_needed"] = len(tokens)
         if not tokens:
             return
-        outcome = await resolve_goto(slot.page, getattr(slot, "net", None), tokens, self.s)
+        # Created here so its request/traffic counts survive a deadline cancel.
+        res.goto = outcome = GotoResolution()
+        await resolve_goto(slot.page, getattr(slot, "net", None), tokens, self.s, out=outcome)
         res.links = outcome.resolved
         res.timings["links_resolved"] = len(outcome.resolved)
         res.timings["links_in_page"] = outcome.in_page
         res.timings["links_ms"] = _ms(t0)
-        if outcome.fallback_requests:
-            res.usage["goto_fallback"] = outcome.fallback_requests
         if outcome.blocked:
             res.classification = Classification.blocked_captcha
             res.reason = "Google answered a /goto link with its /sorry/ (unusual traffic) page"
@@ -238,10 +311,15 @@ class Fetcher:
         if not probe["present"]:
             return True, "no AI Overview"
 
-        # 2) finish: not busy and text length stable for ~300 ms, up to AIO_MAX_WAIT_MS.
+        # 2) finish: not busy and text length stable for STABLE_S, and every visible
+        #    'Show more' / 'Show all' verified as expanded - all within AIO_MAX_WAIT_MS.
+        #    Completion is judged from the page's state, never from having clicked.
         end = time.perf_counter() + self.s.aio_max_wait_ms / 1000
-        clicked: set[str] = set()
+        done: set[str] = set()  # expand controls whose click visibly worked
+        attempts: dict[str, int] = {}
+        problem: dict[str, str] = {}  # why the last click on a control didn't count
         last_len, stable_since = -1, time.perf_counter()
+        pending: list[dict] = []
         while time.perf_counter() < end:
             probe = await page.evaluate(AIO_PROBE_JS)
             if not probe["present"]:
@@ -249,23 +327,49 @@ class Fetcher:
             now = time.perf_counter()
             if probe["len"] != last_len or probe["busy"]:
                 last_len, stable_since = probe["len"], now
-            elif now - stable_since >= 0.3:
-                # 3) expand once each: 'Show more', then 'Show all' (sources)
-                todo = [(i, b) for i, b in enumerate(probe["buttons"]) if b.lower() not in clicked]
-                if not todo:
+            elif now - stable_since >= STABLE_S:
+                pending = _pending_expanders(probe, done)
+                if not pending:
                     return True, "AI Overview complete"
-                i, label = todo[0]
-                clicked.add(label.lower())
-                before = page.url
+                # 3) expand: click, then wait until the page shows the effect.
+                button = pending[0]
+                label, bid = button["label"], button["id"]
+                if attempts.get(bid, 0) >= MAX_EXPAND_ATTEMPTS:
+                    return False, f"could not expand '{label}' after {MAX_EXPAND_ATTEMPTS} attempts ({problem.get(bid, 'no visible change')})"
+                attempts[bid] = attempts.get(bid, 0) + 1
+                before_url = page.url
+                remaining_ms = int((end - time.perf_counter()) * 1000)
+                clicked = False
                 try:
-                    await page.locator(f'[data-serp-click="{i}"]').first.click(timeout=2000)
+                    await page.locator(f'[data-serp-btn="{bid}"]').first.click(timeout=max(1, min(CLICK_TIMEOUT_MS, remaining_ms)))
+                    clicked = True
                 except PlaywrightError as e:
-                    log.warning("could not click '%s': %s", label, str(e).splitlines()[0])
-                if page.url != before:
+                    problem[bid] = f"click failed: {str(e).splitlines()[0][:120]}"
+                    log.warning("could not click '%s' (attempt %d): %s", label, attempts[bid], problem[bid])
+                if page.url != before_url:  # also when the click raised part-way
                     return False, f"clicking '{label}' navigated away"
+                if clicked:
+                    if await self._expansion_verified(page, {**button, "len_before": probe["len"]}, end):
+                        done.add(bid)
+                        problem.pop(bid, None)
+                    else:
+                        problem[bid] = "click made no visible change"
+                        log.warning("clicking '%s' (attempt %d) made no visible change", label, attempts[bid])
                 last_len, stable_since = -1, time.perf_counter()
             await page.wait_for_timeout(100)
-        return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms"
+        left = ", ".join(f"'{b['label']}' ({problem.get(b['id'], 'not clicked yet')})" for b in pending)
+        return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms" + (f"; not expanded: {left}" if left else "")
+
+    async def _expansion_verified(self, page: Page, button: dict, end: float) -> bool:
+        """Poll until the page shows that clicking `button` expanded something,
+        for up to EXPAND_VERIFY_MS (never past `end`)."""
+        until = min(end, time.perf_counter() + EXPAND_VERIFY_MS / 1000)
+        while True:
+            if _expansion_seen(button, await page.evaluate(AIO_PROBE_JS)):
+                return True
+            if time.perf_counter() >= until:
+                return False
+            await page.wait_for_timeout(100)
 
     async def _finish(self, page: Page, res: FetchResult, capture: bool = True) -> None:
         if capture or res.html is None:

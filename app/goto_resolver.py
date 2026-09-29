@@ -6,10 +6,14 @@ site is never contacted. (HEAD doesn't work: it answers 200 without Location.)
 
 1. From the results page itself, with the browser's fetch(redirect: 'manual'):
    same connection (HTTP/2, already open), cookies and proxy session as the
-   page, a few KB in total. Scripts can't read an opaque redirect, so the
-   Location is read from CDP (app/netwatch.py).
+   page, a few KB in total, all of it measured by the page's traffic counter.
+   Scripts can't read an opaque redirect, so the Location is read from CDP
+   (app/netwatch.py). A fetch that fails on the network is retried once, still
+   in the page.
 2. Whatever step 1 didn't capture: the browser context's own request client
-   (same proxy and cookies, no redirects followed).
+   (same proxy and cookies, no redirects followed). It runs outside the
+   browser, so its traffic is reconstructed from each response
+   (netwatch.out_of_page_bytes) and the page's measurement is marked partial.
 
 A /sorry/ Location means Google flagged the traffic: the page is reported as
 blocked_captcha. Nothing is retried on the same session after that.
@@ -23,23 +27,27 @@ from playwright.async_api import Page
 
 from .config import Settings
 from .links import destination_from_location, goto_url
-from .netwatch import NetworkWatch
+from .netwatch import NetworkWatch, out_of_page_bytes
 
 log = logging.getLogger("serp.goto")
 
 RESOLVE_IN_PAGE_JS = r"""
 async ({urls, limit, timeoutMs}) => {
   let next = 0;
-  const one = async (u) => {
+  const attempt = async (u) => {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       await fetch(u, {redirect: 'manual', cache: 'no-store', credentials: 'same-origin', signal: ctl.signal});
+      return true;
     } catch (e) {
+      return false;
     } finally {
       clearTimeout(timer);
     }
   };
+  // A network failure is retried once here, where the traffic counter sees it.
+  const one = async (u) => (await attempt(u)) || attempt(u);
   const worker = async () => { while (next < urls.length) await one(urls[next++]); };
   await Promise.all(Array.from({length: Math.min(limit, urls.length)}, worker));
 }
@@ -58,10 +66,14 @@ class GotoResolution:
     in_page: int = 0
     fallback: int = 0
     fallback_requests: int = 0  # sent outside the page, so the CDP counters don't see them
+    fallback_bytes: int = 0  # their responses, reconstructed (see netwatch.out_of_page_bytes)
 
 
-async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], s: Settings) -> GotoResolution:
-    out = GotoResolution()
+async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], s: Settings,
+                       out: GotoResolution | None = None) -> GotoResolution:
+    """Pass `out` to keep the request/traffic counts even if this is cancelled
+    (e.g. by the request deadline) part-way through."""
+    out = out if out is not None else GotoResolution()
     base = page.url
     urls = {t: goto_url(t, base) for t in tokens}
 
@@ -100,6 +112,7 @@ async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], 
                 except PlaywrightError as e:
                     log.warning("/goto request failed: %s", str(e).splitlines()[0])
                     return
+                out.fallback_bytes += await out_of_page_bytes(resp)
                 if 300 <= resp.status < 400:
                     take(token, resp.headers.get("location"))
                 else:

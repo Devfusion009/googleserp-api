@@ -316,3 +316,43 @@ usage with retries and AI Overview follow-ups; 100 MB for a single-session test.
   full binary.
 
 Tests: 168 (2 need a local Chromium).
+
+## Phase 9 - Review of merged PRs #1/#2 (offline) - DONE
+
+Reviewer found (after merging): (1) `_wait_aio` marked a button clicked before
+the click succeeded, so a failing "Show more"/"Show all" still returned
+"AI Overview complete"; (2) fallback `/goto` requests via
+`page.context.request` were counted as requests but their traffic wasn't in
+`bytes_in`, which the traffic guard relies on. Branch restarted from master.
+
+### 1. AI Overview expansion
+- Reproduced both ways before fixing: a faked page whose click raises, and in
+  a real browser a "Show more" covered by another element (click intercepted)
+  and one that does nothing - old code returned ok (valid result) for both.
+- Now: expand controls get a stable id (`data-serp-btn`) so a click is checked
+  on the same element; a click counts only when the page shows it (control
+  hidden/removed or relabelled, `aria-expanded=true`, or text grew) within
+  1.5 s; failed or ineffective clicks retried up to 3 times within
+  `AIO_MAX_WAIT_MS`; completion = stable text + no visible unexpanded control.
+  Otherwise `aio_incomplete` naming the control and why.
+- Hooks from the saved pages: after expansion the sources panel keeps both
+  "Show all" (`YoEHmf`) and "Show less" (`mWokkb`) in the DOM, no
+  `aria-expanded` on them -> visibility is the signal, not presence. Research:
+  Playwright recommends verifying state with retrying checks rather than
+  trusting a click; Google now auto-expands some AI Overviews (no button).
+
+### 2. Out-of-page traffic
+- Playwright has no size API for its request client (microsoft/playwright#5632;
+  `request.sizes()` is browser-only). So: the in-page `/goto` fetch retries a
+  network failure once in the page (measured); fallback responses and exit-IP
+  checks are rebuilt byte for byte (status line + headers + body) into
+  `bytes_in`; such pages carry `bytes_in_partial`, `out_of_page_requests`,
+  `bytes_out_of_page`; the benchmark adds 6 KB per out-of-page request
+  (CONNECT + TLS handshake ~4-5 KB server flight) to its budget and report.
+- A failure while sizing an exit-IP check no longer turns the check into
+  "unknown" (found by the tests).
+- Found while testing: when a reused keep-alive connection is closed under a
+  request, Chromium sometimes re-sends it by itself and CDP reports one
+  request (server saw 2 hits either way). Documented; no response bytes.
+
+Tests: 183 (7 need a local Chromium; `playwright install chromium`).

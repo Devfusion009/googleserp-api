@@ -55,7 +55,12 @@ def test_link_map_resolves_each_href_kind():
 class FakeResponse:
     def __init__(self, status, location=None):
         self.status = status
+        self.status_text = "Found" if 300 <= status < 400 else "OK"
         self.headers = {"location": location} if location else {}
+        self.headers_array = [{"name": "Location", "value": location}] if location else []
+
+    async def body(self):
+        return b""
 
     async def dispose(self):
         pass
@@ -130,6 +135,12 @@ async def test_fallback_resolves_what_the_page_missed_without_following_redirect
     assert out.resolved == {"A": "https://a.example/1", "B": "https://b.example/2"}
     assert out.unresolved == ["C", "D"] and out.fallback == 1
     assert all(kw["max_redirects"] == 0 for _, kw in page.context.request.calls)
+    # B and C answered, D failed on the network: 3 requests left the page and
+    # the two answers are counted byte for byte (status line + headers + body).
+    assert out.fallback_requests == 3
+    b = len("HTTP/1.1 302 Found\r\n") + len("Location") + len("https://b.example/2") + 4 + 2
+    c = len("HTTP/1.1 200 OK\r\n") + 2
+    assert out.fallback_bytes == b + c
 
 
 async def test_without_a_network_listener_everything_goes_through_the_fallback():
@@ -143,3 +154,29 @@ async def test_a_sorry_redirect_means_blocked_and_stops():
     page = FakePage(net, {"https://www.google.com/goto?url=B": FakeResponse(302, "https://b.example/2")})
     out = await resolve_goto(page, net, ["A", "B"], S)
     assert out.blocked and page.context.request.calls == []
+
+
+def test_out_of_page_traffic_is_added_to_bytes_in_and_marked_partial():
+    from app.fetcher import FetchResult, _add_out_of_page_traffic
+    from app.goto_resolver import GotoResolution
+
+    res = FetchResult(url_sent=SERP)
+    res.timings = {"bytes_in": 100_000}
+    res.usage = {"document": 1, "goto": 5, "goto_fallback": 2}
+    res.goto = GotoResolution(fallback_requests=2, fallback_bytes=700)
+    res.session = {"ip_checks": 2, "ip_check_bytes": 300}
+    _add_out_of_page_traffic(res)
+    assert res.timings["bytes_in"] == 101_000
+    assert res.timings["out_of_page_requests"] == 4 and res.timings["bytes_out_of_page"] == 1000
+    assert res.timings["bytes_in_partial"] is True
+    assert res.requests_used == 1 + 5 + 2  # the fallback /goto requests are Google requests; IP checks aren't
+
+
+def test_in_page_only_traffic_is_not_marked_partial():
+    from app.fetcher import FetchResult, _add_out_of_page_traffic
+
+    res = FetchResult(url_sent=SERP)
+    res.timings = {"bytes_in": 100_000}
+    res.usage = {"document": 1, "goto": 5}
+    _add_out_of_page_traffic(res)
+    assert res.timings == {"bytes_in": 100_000}
