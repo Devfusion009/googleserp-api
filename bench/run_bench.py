@@ -44,6 +44,17 @@ PROXY_LABEL = "Run through proxies (PROXY_MODE={mode})."
 # outside the page, so a traffic budget is only spent up to this share.
 BUDGET_SAFETY_SHARE = 0.7
 FIRST_PAGE_RESERVE_MB = 3.0  # assumed size of a page before any has been measured
+# Requests made outside the browser (/goto fallback, exit-IP checks) have their
+# responses reconstructed but not their connection cost: a proxy CONNECT plus a
+# TLS handshake is about 4-5 KB from the server (certificate chain) plus the
+# request itself. Assume a fresh connection every time.
+OUT_OF_PAGE_ALLOWANCE_BYTES = 6 * 1024
+
+
+def page_traffic_bytes(timings: dict) -> int:
+    """A page's traffic for budgeting: measured bytes plus the allowance for
+    out-of-page requests whose connection overhead can't be measured."""
+    return int(timings.get("bytes_in", 0)) + int(timings.get("out_of_page_requests", 0)) * OUT_OF_PAGE_ALLOWANCE_BYTES
 STAGES = ("nav_ms", "results_ms", "aio_ms", "links_ms", "total_ms")
 
 
@@ -164,13 +175,17 @@ def summarize(calls: list[Call]) -> dict:
     def avg(vals: list, digits: int = 0):
         return round(sum(vals) / len(vals), digits or None) if vals else None
 
-    kb_in = [b / 1024 for b in per_page("bytes_in")]
+    kb_in = [page_traffic_bytes(c.timings) / 1024 for c in calls if "bytes_in" in c.timings]
+    allowance_kb = sum(c.timings.get("out_of_page_requests", 0) for c in calls) * OUT_OF_PAGE_ALLOWANCE_BYTES / 1024
     needed, resolved = per_page("links_needed"), per_page("links_resolved")
     traffic = {
         "pages": len(kb_in),
         "avg_kb": avg(kb_in),
         "max_kb": round(max(kb_in)) if kb_in else None,
         "total_mb": round(sum(kb_in) / 1024, 2) if kb_in else None,
+        "partial_pages": sum(1 for c in calls if c.timings.get("bytes_in_partial")),
+        "out_of_page_requests": sum(c.timings.get("out_of_page_requests", 0) for c in calls),
+        "allowance_mb": round(allowance_kb / 1024, 3),
         "avg_requests": avg(per_page("net_requests")),
         "avg_links_needed": avg(needed, 1),
         "links_unresolved": sum(needed) - sum(resolved) if needed else None,
@@ -256,7 +271,7 @@ def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, di
         t = s["traffic"]
         lines += [
             "",
-            "### Traffic (received over the network, from the browser's CDP counters)",
+            "### Traffic (received: the browser's CDP counters, plus reconstructed out-of-page responses and an allowance per out-of-page request)",
             "",
             f"- Pages measured: {t['pages']}; per page avg **{t['avg_kb'] if t['avg_kb'] is not None else '-'} KB**, "
             f"max {t['max_kb'] if t['max_kb'] is not None else '-'} KB; run total {t['total_mb'] if t['total_mb'] is not None else '-'} MB",
@@ -264,6 +279,9 @@ def render_report(run_id: str, args: argparse.Namespace, by_corpus: dict[str, di
             f"/goto links resolved per page (avg): {t['avg_links_needed'] if t['avg_links_needed'] is not None else '-'}, "
             f"left unresolved in total: {t['links_unresolved'] if t['links_unresolved'] is not None else '-'}",
             "- Excludes upload (request headers, roughly 0.5-1 KB per request) and TLS overhead; the proxy provider's usage figure is authoritative.",
+            f"- Requests outside the browser (/goto fallback, exit-IP checks): {t['out_of_page_requests']}; "
+            f"their responses are counted, and {OUT_OF_PAGE_ALLOWANCE_BYTES // 1024} KB each is added for their connection/TLS "
+            f"overhead ({t['allowance_mb']} MB, included above). Pages with a partial measurement: {t['partial_pages']}.",
         ]
         u = s["usage"]
         kinds = ", ".join(f"{k}={v}" for k, v in sorted(u["by_kind"].items())) or "-"
@@ -322,7 +340,7 @@ async def run(args: argparse.Namespace) -> int:
         share of the budget (the browser counter misses upload and TLS overhead)."""
         if not args.traffic_budget_mb:
             return False
-        pages = [c.timings.get("bytes_in", 0) / 1024 / 1024 for c in calls]
+        pages = [page_traffic_bytes(c.timings) / 1024 / 1024 for c in calls]
         reserve = max(pages) if pages else FIRST_PAGE_RESERVE_MB
         return sum(pages) + reserve > args.traffic_budget_mb * BUDGET_SAFETY_SHARE
 

@@ -29,6 +29,25 @@ GOOGLE_DOMAINS = ("google.com", "gstatic.com", "googleapis.com", "googleusercont
 BLOCKED_ERRORS = {"net::ERR_FAILED", "net::ERR_BLOCKED_BY_CLIENT"}
 
 
+async def out_of_page_bytes(resp) -> int:
+    """Bytes received for a response of Playwright's request client (APIResponse):
+    status line + header block + body, as HTTP/1.1 puts them on the wire.
+
+    Requests made with context.request (the /goto fallback, exit-IP checks) run
+    outside the browser, so CDP never sees them, and Playwright has no size API
+    for them (microsoft/playwright#5632). This reconstruction is exact for what
+    it covers but misses the connection's CONNECT/TLS overhead, so a page that
+    used such requests is marked bytes_in_partial and the benchmark's traffic
+    guard adds OUT_OF_PAGE_ALLOWANCE_BYTES per request on top."""
+    status_line = len(f"HTTP/1.1 {resp.status} {resp.status_text}\r\n".encode())
+    headers = sum(len(h["name"].encode()) + len(h["value"].encode()) + 4 for h in resp.headers_array) + 2
+    try:
+        body = len(await resp.body())
+    except Exception:  # body already disposed or unreadable - count the headers only
+        body = 0
+    return status_line + headers + body
+
+
 def _is_google_owned(host: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in GOOGLE_DOMAINS)
 

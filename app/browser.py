@@ -31,7 +31,7 @@ from typing import AsyncContextManager, Protocol
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 
 from .config import Settings
-from .netwatch import NetworkWatch
+from .netwatch import NetworkWatch, out_of_page_bytes
 from .proxy import ProxyProvider, make_provider, mask_proxy, to_playwright
 
 log = logging.getLogger("serp.browser")
@@ -136,13 +136,20 @@ class BrowserManager:
         None when not configured or the check failed."""
         if not self.s.exit_ip_check_url or slot.context is None:
             return None
+        # The check goes through the proxy outside the browser: count it and its
+        # reconstructed bytes into this request's traffic (the fetcher adds them).
+        slot.report["ip_checks"] = slot.report.get("ip_checks", 0) + 1
         try:
             resp = await slot.context.request.get(self.s.exit_ip_check_url, timeout=self.s.exit_ip_check_timeout_ms)
             ip = parse_ip(await resp.text()) if resp.ok else None
-            await resp.dispose()
         except Exception as e:  # a failed check is "unknown", never a reason to fail the request
             log.warning("slot=%d exit IP check failed: %s", slot.index, str(e).splitlines()[0][:200])
             return None
+        try:
+            slot.report["ip_check_bytes"] = slot.report.get("ip_check_bytes", 0) + await out_of_page_bytes(resp)
+            await resp.dispose()
+        except Exception as e:  # accounting must not change the check's answer
+            log.warning("slot=%d could not size the exit IP check: %s", slot.index, str(e).splitlines()[0][:200])
         return ip
 
     async def _close(self, slot: Slot, reason: str) -> None:
@@ -188,6 +195,7 @@ class BrowserManager:
         return None
 
     async def _prepare(self, slot: Slot, country: str | None, language: str | None) -> None:
+        slot.report = {}  # this request's session facts; exit-IP checks count into it
         locale = locale_for(country, language)
         template = self.provider.next(country) if (self.provider.rotates or slot.context is None) else slot.proxy_template
         reason = self._rebuild_reason(slot, template, locale)
@@ -204,7 +212,7 @@ class BrowserManager:
                 await self._build(slot, template, locale)
             elif ip:
                 slot.exit_ip = ip
-        slot.report = {"session": slot.session, "exit_ip": slot.exit_ip}
+        slot.report.update(session=slot.session, exit_ip=slot.exit_ip)
         log.info("slot=%d proxy=%s session=%s exit_ip=%s locale=%s",
                  slot.index, mask_proxy(slot.proxy), slot.session, slot.exit_ip, slot.locale)
 

@@ -21,7 +21,7 @@ degraded or incomplete page is reported as a failure, not a result.
 | Proxy support | Done - switch on with config only (see [Proxies](#proxies)) |
 | Benchmark client | Done - see [Benchmark](#benchmark); now also reports traffic per page |
 | **Live performance numbers** | **Not available yet.** The development machine's IP (India, no proxy) gets Google's "unusual traffic" CAPTCHA on the very first request, every time. The one local benchmark run stopped after 1 request (`blocked_captcha`). Valid-rate and latency against the client's targets can only be measured through the client's US residential proxies. |
-| Live AI Overview wait/expand logic | Written, never exercised live (same reason). Parsers and classification are verified on saved pages; the in-browser waiting/clicking is not. |
+| Live AI Overview wait/expand logic | Verified in a real browser against local pages (a "Show more" that works, one whose click fails, one that changes nothing); not yet exercised on live Google. A click only counts once the page shows it worked; otherwise `aio_incomplete`. |
 
 "End to end" today means: a saved real Google page goes through the same
 classifier, `/goto` token collection, parsers, completeness gate and error
@@ -128,14 +128,29 @@ link resolutions (4-18 per page on the saved pages). Requests are counted from
 the browser's network events once they got an answer or failed on the network;
 resources the blocker stopped never left the browser and aren't counted.
 Scripts, styles and logging pings to Google hosts are not in `requests_used`
-but are reported in `X-Google-Requests`.
+but are reported in `X-Google-Requests`. One thing browser-side counting can't
+see: when a reused connection is closed under a request, Chromium's network
+stack may re-send that request by itself, and CDP reports it as one request
+(verified locally; such a re-send carries no response bytes).
+
+**Traffic** (`bytes_in`) is what the page received: the browser's own counter
+(CDP) for everything the page loads, plus the requests made outside the browser
+- the `/goto` fallback and exit-IP checks - whose responses are rebuilt byte for
+byte (status line, headers, body). Playwright has no size API for those, and
+their connection/TLS overhead can't be measured, so a page that used any is
+marked `bytes_in_partial: true` with `out_of_page_requests` and
+`bytes_out_of_page`; the benchmark adds 6 KB per such request (a proxy CONNECT
+plus a TLS handshake with a fresh connection) before comparing with a traffic
+budget. Upload and TLS overhead of the page's own requests are not in
+`bytes_in` either - hence the budget's 70% safety share.
 
 **Debug headers** (never in the JSON body): `X-Request-Id`, `X-Classification`,
 `X-AIO-State` (`absent` / `complete` / `incomplete`), `X-Timings` (JSON: `nav_ms`,
 `results_ms`, `aio_ms`, `links_ms`, `total_ms`, `attempt`; `links_needed` /
-`links_resolved` / `links_in_page` for `/goto` resolution; `bytes_in` and
-`net_requests` - bytes received over the network and requests made for the
-page), `X-Google-Requests` (JSON: `requests_used` and every request by kind -
+`links_resolved` / `links_in_page` for `/goto` resolution; `bytes_in`,
+`net_requests`, and when requests went outside the browser
+`out_of_page_requests` / `bytes_out_of_page` / `bytes_in_partial` - see
+Traffic above), `X-Google-Requests` (JSON: `requests_used` and every request by kind -
 `document`, `async`, `goto`, `goto_fallback`, `other_google`, `non_google`),
 `X-Proxy-Session` (JSON: the proxy `session` id, `exit_ip` before and
 `exit_ip_after` the request, `ip_changed`), `X-Artifact-Dir` (saved HTML +
@@ -156,7 +171,7 @@ All settings come from `.env` (see `.env.example`) or environment variables.
 | `BLOCK_RESOURCES` | `true` | skip images, media and fonts (scripts and stylesheets are never blocked - the AI Overview needs them). Blocking uses request routing, which turns off the browser's HTTP cache: every page downloads Google's scripts again (see [Known limitations](#known-limitations)). |
 | `NAV_TIMEOUT_MS` | `15000` | navigation timeout, and max wait for the results container |
 | `AIO_APPEAR_WAIT_MS` | `1500` | how long to wait for an AI Overview to appear once results are visible |
-| `AIO_MAX_WAIT_MS` | `8000` | max time for a present AI Overview to finish loading and expand; beyond this -> `aio_incomplete` |
+| `AIO_MAX_WAIT_MS` | `8000` | max time for a present AI Overview to finish loading and expand (clicks and their retries included); beyond this -> `aio_incomplete` |
 | `REQUEST_DEADLINE_MS` | `25000` | hard cap per page load -> `timeout` |
 | `MAX_RETRIES` | `0` | retries for `timeout` / `network_error` only - never for a CAPTCHA |
 | `GOTO_CONCURRENCY` | `16` | `/goto` links resolved in parallel per page |
@@ -263,9 +278,12 @@ The corpora are `bench/corpora/mixed.txt` (15 queries, US/English) and
 .venv/bin/python -m pytest
 ```
 
-168 tests, none touching Google (2 of them need a local Chromium and are
-skipped without one; point `BROWSER_EXECUTABLE_PATH` at a headless shell - the
-full browser contacts Google by itself, see `HEADLESS`):
+183 tests, none touching Google. The 7 in `test_browser_local.py` need a local
+Chromium and are skipped without one - they carry the evidence for the
+AI Overview expansion and traffic rules, so run them:
+`.venv/bin/playwright install chromium` (installs the headless shell they use),
+or point `BROWSER_EXECUTABLE_PATH` at a headless shell binary. Don't point it at
+the full browser: it contacts Google by itself (see `HEADLESS`).
 
 - `test_pipeline.py` - **classification and parsing together** on the 16 real
   saved pages: each goes through `classify_page`, the fetcher's `/goto` token
@@ -278,13 +296,22 @@ full browser contacts Google by itself, see `HEADLESS`):
 - `test_parsers.py` - every parser against the real pages (field values, no
   breadcrumb URLs, sitelinks, suggestions, knowledge panel, ads).
 - `test_links.py` - link rules and the `/goto` resolver (in-page, fallback,
-  `/sorry/`, no redirects followed) with the browser faked.
+  `/sorry/`, no redirects followed, fallback bytes rebuilt exactly) with the
+  browser faked; out-of-page traffic folded into `bytes_in` and marked partial.
+- `test_aio_expand.py` - AI Overview expansion with a faked page: a click that
+  raises is retried and, if it never works, is `aio_incomplete` (never
+  "complete"); a click with no visible effect doesn't count; expansion is
+  verified by the control hiding, changing label, `aria-expanded`, or growth.
 - `test_browser_local.py` - the production browser path (BrowserManager +
   Fetcher + run_serp, resource blocking on) in a real Chromium against a local
   stand-in for Google: `/goto` links resolved in the page through CDP,
   stylesheet-hidden failure templates ignored, images blocked, bytes counted,
-  `/goto` requests counted in `requests_used`, `/sorry/` -> `blocked_captcha`.
-  Skipped if no Chromium can be launched.
+  `/goto` requests counted in `requests_used`, `/sorry/` -> `blocked_captcha`;
+  a "Show more" that works (its section is parsed), one covered by another
+  element so the click fails, and one that changes nothing (both
+  `aio_incomplete`); a forced `/goto` fallback whose traffic lands in
+  `bytes_in` with `bytes_in_partial`; a timed-out in-page `/goto` retried in
+  the page.
 - `test_browser_sessions.py` - proxy sessions with a fake browser: a fresh
   `{session}` id per context, rotation by age and after a CAPTCHA, an exit-IP
   change while idle (new session first) and during a request (recorded, new
@@ -469,10 +496,19 @@ still `degraded_page` first.
 - **No live numbers yet.** From the development IP every automated request was
   CAPTCHA-blocked (2 of 2 attempts, ~18 h apart, 1 request each). Valid rate and
   latency are unmeasured.
-- **Fetcher AI Overview logic untested live.** Detecting a loading AI Overview,
-  waiting for it to settle and clicking "Show more"/"Show all" has only been
-  tested with mocks. The hooks it uses (the "AI Overview" heading, `aria-busy`,
-  text-length stability) are reasonable but unconfirmed on a live page.
+- **AI Overview expansion untested on live Google.** The rules - wait until the
+  text is stable and not busy; click each visible "Show more"/"Show all"; count
+  a click only when the page shows it worked (the control hides or changes
+  label, `aria-expanded` turns true, or the text grows); retry a failed or
+  ineffective click up to 3 times within `AIO_MAX_WAIT_MS`; complete only when
+  no visible, unexpanded control is left - are tested with a faked page and in
+  a real browser against local pages, not on Google. The hooks come from the
+  saved pages (after expanding, Google keeps the "Show all" element in the DOM
+  next to a "Show less", so presence alone proves nothing). A control that
+  stays visible and whose click changes nothing on a live page would make that
+  query `aio_incomplete`; the error message names it, so the smoke test will
+  show it. Google has also started expanding some AI Overviews by itself
+  (no button), which needs no click.
 - **`/goto` resolution untested against live Google.** The mechanism (302 +
   `Location`, `GET` not `HEAD`, token not tied to cookies, no expiry within
   hours) follows public measurements from September 2026 and was verified in a

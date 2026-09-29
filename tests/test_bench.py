@@ -176,3 +176,35 @@ def test_run_continues_past_captcha_when_stop_on_block_false(monkeypatch, tmp_pa
     args = run_bench.parse_args(["--corpus", "mixed", "--limit", "3", "--min-delay", "0"])
     assert asyncio.run(run_bench.run(args)) == 0
     assert len(seen) == 3
+
+
+def test_traffic_includes_out_of_page_allowance_and_partial_pages():
+    mb = 1024 * 1024
+    calls = [
+        Call("mixed", "u1", 200, "ok", 900, "absent", None, {"bytes_in": 1 * mb}),
+        Call("mixed", "u2", 200, "ok", 900, "absent", None,
+             {"bytes_in": 1 * mb, "out_of_page_requests": 4, "bytes_out_of_page": 2000, "bytes_in_partial": True}),
+    ]
+    assert run_bench.page_traffic_bytes(calls[1].timings) == mb + 4 * run_bench.OUT_OF_PAGE_ALLOWANCE_BYTES
+    t = summarize(calls)["traffic"]
+    assert t["partial_pages"] == 1 and t["out_of_page_requests"] == 4
+    assert t["total_mb"] == round((2 * mb + 4 * run_bench.OUT_OF_PAGE_ALLOWANCE_BYTES) / mb, 2)
+    report = render_report("rid", run_bench.parse_args(["--min-delay", "0"]), {"mixed": summarize(calls)}, None)
+    assert "Pages with a partial measurement: 1" in report
+
+
+def test_budget_guard_counts_the_out_of_page_allowance(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_bench, "REPORTS", tmp_path)
+    monkeypatch.setattr(run_bench, "OUT_OF_PAGE_ALLOWANCE_BYTES", 5 * 1024 * 1024)  # exaggerated to make it decisive
+    seen = []
+
+    async def fake_call_api(client, base_url, api_key, corpus, url):
+        seen.append(url)
+        return Call(corpus, url, 200, "ok", 100, "absent", None,
+                    {"bytes_in": 10 * 1024 * 1024, "out_of_page_requests": 2, "bytes_in_partial": True}), {}
+
+    monkeypatch.setattr(run_bench, "call_api", fake_call_api)
+    args = run_bench.parse_args(["--corpus", "mixed", "--min-delay", "0", "--traffic-budget-mb", "100"])
+    assert asyncio.run(run_bench.run(args)) == 0
+    # 20 MB per page with the allowance (10 without): a 4th page could reach 80 > 70.
+    assert len(seen) == 3

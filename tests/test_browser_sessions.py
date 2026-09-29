@@ -9,9 +9,14 @@ from app.proxy import StaticProxy
 class FakeResponse:
     def __init__(self, text, ok=True):
         self._text, self.ok = text, ok
+        self.status, self.status_text = 200, "OK"
+        self.headers_array = [{"name": "Content-Type", "value": "text/plain"}]
 
     async def text(self):
         return self._text
+
+    async def body(self):
+        return self._text.encode()
 
     async def dispose(self):
         pass
@@ -123,6 +128,9 @@ async def test_ip_change_during_a_request_is_recorded_and_the_session_retired():
     await use(m)
     assert len(m.browser.contexts) == 2 and usernames(m)[0] != usernames(m)[1]
     assert report["ip_changed"]  # the earlier request's record is untouched
+    # the checks went through the proxy too: counted, with their bytes, per request
+    one = len("HTTP/1.1 200 OK\r\n") + len("Content-Type") + len("text/plain") + 4 + 2 + len("203.0.113.1")
+    assert report["ip_checks"] == 2 and report["ip_check_bytes"] == 2 * one
 
 
 async def test_a_failed_ip_check_is_unknown_not_a_change():
