@@ -1,0 +1,7 @@
+{
+  "name": "serp-api-brd",
+  "private": true,
+  "description": "Builds the BRD diagrams, Word document and PDF",
+  "scripts": { "build": "./build.sh" },
+  "dependencies": { "docx": "^9.8.1", "lucide-static": "^1.49.0", "playwright": "^1.56.0" }
+}
