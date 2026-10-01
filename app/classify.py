@@ -57,6 +57,9 @@ BASIC_HTML_TEXT = ("switch to the basic version", "you're using the basic versio
 
 # Text Google shows inside an AI Overview while generating or when it failed.
 AIO_LOADING_TEXT = ("generating", "searching", "thinking")
+# What a served-but-empty AI Overview block shows: the heading and an "AI Mode
+# reply for <query>" header, with no answer under it.
+AIO_STUB_TEXT = "ai mode reply for"
 AIO_FAILED_TEXT = (
     "an ai overview is not available for this search",
     "can't generate an ai overview right now",
@@ -105,11 +108,23 @@ def _visible_text(tree: HTMLParser) -> str:
     return visible_text(tree.body)
 
 
+def _in_related_question(node: Node) -> bool:
+    """A "People also ask" item. Google can show an AI Overview as the answer of one of
+    these questions; it answers that question, not the searched query."""
+    cur = node.parent
+    while cur is not None:
+        if "related-question-pair" in (cur.attributes.get("class") or "").split():
+            return True
+        cur = cur.parent
+    return False
+
+
 def find_aio_root(tree: HTMLParser) -> Node | None:
-    """The AI Overview block: the nearest large container around a heading whose
-    text is exactly 'AI Overview'. Confirmed/refined against fixtures in Phase 3."""
+    """The AI Overview block of the searched query: the nearest large container around a
+    heading whose text is exactly 'AI Overview', skipping any inside a People Also Ask
+    item. Confirmed/refined against fixtures in Phase 3."""
     for h in tree.css("h1, h2, div[role=heading], span[role=heading]"):
-        if (h.text(strip=True) or "").lower() == "ai overview":
+        if (h.text(strip=True) or "").lower() == "ai overview" and not _in_related_question(h):
             node = h
             # climb until the container holds more than the heading itself
             for _ in range(8):
@@ -134,8 +149,25 @@ def aio_state(tree: HTMLParser) -> tuple[AioState, str]:
     if len(body) < 80 and any(t in body for t in AIO_LOADING_TEXT):
         return AioState.incomplete, "AI Overview still loading"
     if len(body) < 40:
+        # Visibility only rules out Google's failure templates (checked above).
+        # The answer itself counts when its paragraphs/sections are in the DOM,
+        # rendered visible or not: Google keeps the full text in the DOM whatever
+        # the collapse state, and a visibility miss must not hide a real answer.
+        if _has_answer(root):
+            return AioState.complete, "AI Overview text present"
+        if AIO_STUB_TEXT in body:
+            return AioState.incomplete, "AI Overview not served: only the 'AI Mode reply' placeholder, no answer text"
         return AioState.incomplete, f"AI Overview has only {len(body)} chars of text"
     return AioState.complete, "AI Overview text present"
+
+
+def _has_answer(root: Node) -> bool:
+    """Does the AI Overview block hold answer text (intro or a section), as the
+    AIO parser reads it? Parses a copy - parse_aio edits the tree it is given."""
+    from .parsers.aio import parse_aio  # parsers import this module
+
+    parsed = parse_aio(HTMLParser(root.html or "").body)
+    return bool(parsed.intro or parsed.sections)
 
 
 def classify_page(final_url: str, html: str, organic_count: int | None = None) -> PageVerdict:

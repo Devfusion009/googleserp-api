@@ -85,7 +85,22 @@ def test_call_api_failure_carries_message_and_artifact():
     assert call.artifact_dir == "artifacts/x"
 
 
-def test_summarize_counts_all_requests_in_latency_and_reports_pass_fail():
+@pytest.fixture
+def proxy_mode(monkeypatch):
+    """Set PROXY_MODE for one test (environment beats .env) and drop the cached settings."""
+    from app.config import get_settings
+
+    def _set(mode: str) -> None:
+        monkeypatch.setenv("PROXY_MODE", mode)
+        get_settings.cache_clear()
+
+    yield _set
+    monkeypatch.undo()
+    get_settings.cache_clear()
+
+
+def test_summarize_counts_all_requests_in_latency_and_reports_pass_fail(proxy_mode):
+    proxy_mode("none")  # the report's "local run" label depends on it, not on the developer's .env
     calls = [
         Call("mixed", "u1", 200, "ok", 800, "complete", 5, {"nav_ms": 300, "total_ms": 800}),
         Call("mixed", "u2", 200, "ok", 1200, "absent", None, {"nav_ms": 400, "total_ms": 1200}),
@@ -104,6 +119,12 @@ def test_summarize_counts_all_requests_in_latency_and_reports_pass_fail():
     assert "aio_incomplete" in report and "artifacts/a" in report
     assert "FAIL" in report
     assert "Caution" in report  # latency caveat when valid rate misses target
+
+
+def test_report_labels_a_proxied_run_as_proxied(proxy_mode):
+    proxy_mode("static")
+    report = render_report("rid", run_bench.parse_args(["--min-delay", "0"]), {}, None)
+    assert "PROXY_MODE=static" in report and run_bench.LOCAL_LABEL not in report
 
 
 def test_run_stops_at_first_captcha(monkeypatch, tmp_path):
