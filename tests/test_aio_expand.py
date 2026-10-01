@@ -105,3 +105,46 @@ async def test_running_out_of_time_with_a_button_left_is_incomplete():
 async def test_no_buttons_is_complete():
     ok, reason = await fetcher()._wait_aio(FakePage([]))
     assert ok and reason == "AI Overview complete"
+
+
+# --- deferred AI Overview: the block arrives as a shell, filled by an /async/ request ---
+
+class FakeNet:
+    """The two NetworkWatch fields _wait_aio reads."""
+
+    def __init__(self, pending=(), done=0):
+        self.async_pending, self.async_done = set(pending), done
+
+
+async def test_a_shell_is_not_settled_while_its_async_request_is_in_flight():
+    page, net = FakePage([]), FakeNet(pending={"r1"})
+    page.len = 40  # heading + "AI Mode reply for ..."
+
+    async def answer_arrives():
+        await asyncio.sleep(0.8)
+        page.len = 1200
+        net.async_pending.clear()
+        net.async_done = 1
+
+    task = asyncio.create_task(answer_arrives())
+    ok, reason = await fetcher()._wait_aio(page, net)
+    await task
+    assert ok, reason
+    assert page.len == 1200  # it waited for the answer instead of settling on the shell
+
+
+async def test_a_shell_waits_for_an_async_request_to_start_and_finish():
+    # No /async/ request seen yet: a short, stable block is not taken as settled.
+    page, net = FakePage([]), FakeNet()
+    page.len = 40
+    ok, reason = await fetcher(max_wait_ms=700)._wait_aio(page, net)
+    assert not ok and "not finished" in reason
+
+
+async def test_a_shell_after_its_async_request_finished_is_left_to_the_classifier():
+    # The request came back without an answer: the wait ends and the classifier
+    # reports the empty block.
+    page, net = FakePage([]), FakeNet(done=1)
+    page.len = 40
+    ok, reason = await fetcher()._wait_aio(page, net)
+    assert ok and reason == "AI Overview complete"

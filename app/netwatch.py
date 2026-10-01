@@ -75,6 +75,8 @@ class NetworkWatch:
         self._answered: set[str] = set()  # requestIds whose current hop got response headers
         self._goto_urls: dict[str, str] = {}  # requestId -> /goto URL
         self._redirects: dict[str, str | None] = {}  # requestId -> Location of a 3xx answer
+        self.async_pending: set[str] = set()  # /async/ requests (the AIO loads this way) not finished yet
+        self.async_done = 0  # /async/ requests finished or failed since the last reset()
 
     async def attach(self, context: BrowserContext, page: Page) -> None:
         cdp = await context.new_cdp_session(page)
@@ -92,6 +94,13 @@ class NetworkWatch:
         self._answered.clear()
         self._goto_urls.clear()
         self._redirects.clear()
+        self.async_pending.clear()
+        self.async_done = 0
+
+    def _async_ended(self, request_id: str) -> None:
+        if request_id in self.async_pending:
+            self.async_pending.discard(request_id)
+            self.async_done += 1
 
     def goto_locations(self) -> dict[str, str | None]:
         """/goto token -> Location header, for every /goto request answered with a redirect."""
@@ -112,6 +121,8 @@ class NetworkWatch:
             self._answered.discard(rid)
         url = ev.get("request", {}).get("url", "")
         self._sent[rid] = (url, ev.get("type"))
+        if request_kind(url, ev.get("type")) == "async":
+            self.async_pending.add(rid)
         if goto_token(url, any_host=True):
             self._goto_urls.setdefault(rid, url)
         if rid in self._answered:  # its response headers arrived first
@@ -132,7 +143,9 @@ class NetworkWatch:
     def _on_finished(self, ev: dict) -> None:
         self.bytes += int(ev.get("encodedDataLength") or 0)
         self._count(ev["requestId"])
+        self._async_ended(ev["requestId"])
 
     def _on_failed(self, ev: dict) -> None:
         if ev.get("errorText") not in BLOCKED_ERRORS or ev.get("canceled"):
             self._count(ev["requestId"])
+        self._async_ended(ev["requestId"])

@@ -24,6 +24,7 @@ import logging
 import re
 import secrets
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncContextManager, Protocol
@@ -33,6 +34,28 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, Rout
 from .config import Settings
 from .netwatch import NetworkWatch, out_of_page_bytes
 from .proxy import ProxyProvider, make_provider, mask_proxy, to_playwright
+
+# Init script from web-agent-master/google-search (src/search.ts), applied to every page.
+REPO_FINGERPRINT_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'zh-CN'] });
+window.chrome = { runtime: {}, loadTimes: function () {}, csi: function () {}, app: {} };
+if (typeof WebGLRenderingContext !== 'undefined') {
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function (p) {
+    if (p === 37445) return 'Intel Inc.';
+    if (p === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, p);
+  };
+}
+if (window === window.top) {
+  Object.defineProperty(window.screen, 'width', { get: () => 1920 });
+  Object.defineProperty(window.screen, 'height', { get: () => 1080 });
+  Object.defineProperty(window.screen, 'colorDepth', { get: () => 24 });
+  Object.defineProperty(window.screen, 'pixelDepth', { get: () => 24 });
+}
+"""
 
 log = logging.getLogger("serp.browser")
 
@@ -72,6 +95,7 @@ class Slot:
     exit_ip: str | None = None
     retire: str | None = None
     report: dict = field(default_factory=dict)
+    ip_checked_at: float | None = None  # monotonic time of the last exit-IP check that answered
 
 
 def locale_for(country: str | None, language: str | None) -> str:
@@ -108,11 +132,30 @@ class BrowserManager:
             kwargs["channel"] = "chrome"
         if self.s.browser_executable_path:
             kwargs["executable_path"] = self.s.browser_executable_path
+        if self.s.repo_fingerprint:
+            kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
         self.browser = await self._pw.chromium.launch(**kwargs)
         for i in range(max(1, self.s.concurrency)):
             self._slots.put_nowait(Slot(i))
         log.info("browser started channel=%s headless=%s slots=%d proxy_mode=%s",
                  self.s.browser_channel, self.s.headless, self.s.concurrency, self.s.proxy_mode)
+        if self.s.prewarm_slots:
+            await self.prewarm()
+
+    async def prewarm(self) -> None:
+        """Build every slot's context for the default locale now, so the first
+        request doesn't wait for it. A slot that fails is built on first use."""
+        slots = [self._slots.get_nowait() for _ in range(self._slots.qsize())]
+        try:
+            for slot in slots:
+                try:
+                    await self._prepare(slot, None, None)
+                except Exception as e:
+                    log.warning("slot=%d prewarm failed: %s", slot.index, str(e).splitlines()[0][:200])
+                    await self._close(slot, "prewarm failed")
+        finally:
+            for slot in slots:
+                self._slots.put_nowait(slot)
 
     async def stop(self) -> None:
         while not self._slots.empty():
@@ -142,6 +185,8 @@ class BrowserManager:
         try:
             resp = await slot.context.request.get(self.s.exit_ip_check_url, timeout=self.s.exit_ip_check_timeout_ms)
             ip = parse_ip(await resp.text()) if resp.ok else None
+            if ip:
+                slot.ip_checked_at = time.monotonic()
         except Exception as e:  # a failed check is "unknown", never a reason to fail the request
             log.warning("slot=%d exit IP check failed: %s", slot.index, str(e).splitlines()[0][:200])
             return None
@@ -172,7 +217,12 @@ class BrowserManager:
         )
         if proxy:
             opts["proxy"] = to_playwright(proxy)
+        state = self.s.repo_state_file
+        if state and Path(state).exists():
+            opts["storage_state"] = state
         slot.context = await self.browser.new_context(**opts)
+        if self.s.repo_fingerprint:
+            await slot.context.add_init_script(REPO_FINGERPRINT_JS)
         if self.s.block_resources:
             await slot.context.route("**/*", self._block)
         slot.page = await slot.context.new_page()
@@ -203,7 +253,7 @@ class BrowserManager:
             await self._close(slot, reason)
         if slot.context is None:
             await self._build(slot, template, locale)
-        elif self.s.exit_ip_check_url:
+        elif self.s.exit_ip_check_url and not self._ip_checked_recently(slot):
             ip = await self.exit_ip(slot)
             if ip and slot.exit_ip and ip != slot.exit_ip:
                 # The session moved to another IP while idle: don't bring this
@@ -215,6 +265,10 @@ class BrowserManager:
         slot.report.update(session=slot.session, exit_ip=slot.exit_ip)
         log.info("slot=%d proxy=%s session=%s exit_ip=%s locale=%s",
                  slot.index, mask_proxy(slot.proxy), slot.session, slot.exit_ip, slot.locale)
+
+    def _ip_checked_recently(self, slot: Slot) -> bool:
+        recheck = self.s.exit_ip_recheck_seconds
+        return bool(recheck and slot.ip_checked_at is not None and time.monotonic() - slot.ip_checked_at < recheck)
 
     @asynccontextmanager
     async def page(self, country: str | None = None, language: str | None = None):

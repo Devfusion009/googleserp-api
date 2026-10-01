@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     nav_timeout_ms: int = 15000
     aio_appear_wait_ms: int = 1500
     aio_max_wait_ms: int = 8000
+    aio_click_timeout_ms: int = 4000  # per 'Show more/all' click attempt (still bounded by aio_max_wait_ms)
     request_deadline_ms: int = 25000
     max_retries: int = 0
     goto_concurrency: int = 16
@@ -37,7 +38,26 @@ class Settings(BaseSettings):
     proxy_session_max_seconds: int = 0
     exit_ip_check_url: str = ""
     exit_ip_check_timeout_ms: int = 5000
+    # Skip the exit-IP check before a request when this slot's IP was checked this
+    # recently (the previous request's check after it). 0 = check before every request.
+    exit_ip_recheck_seconds: float = 60
+    # Build each slot's context (and run its first exit-IP check) at startup, so
+    # the first request doesn't pay for it.
+    prewarm_slots: bool = True
+    # How a Google results page is opened: "url" goes straight to the requested /search URL;
+    # "typed" opens the Google homepage, types the query into the search box with per-key
+    # delays and presses Enter, like a person (the approach of web-agent-master/google-search).
+    # Typed mode only applies to page 1 of a query (no `start` offset) and adds ~1-3 s.
+    search_mode: Literal["url", "typed"] = "url"
+    typed_key_delay_min_ms: int = 30
+    typed_key_delay_max_ms: int = 90
+    # web-agent-master/google-search techniques (POC, opt-in): "fingerprint" patches navigator/
+    # window/WebGL/screen values with init scripts; "state_file" reuses cookies saved after a
+    # successful search (storage state) and saves them again after each success.
+    repo_fingerprint: bool = False
+    repo_state_file: str = ""
     debug_artifacts: bool = True
+    debug_screenshot_on_success: bool = False
     artifacts_dir: str = "artifacts"
 
 

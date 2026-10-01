@@ -7,11 +7,13 @@ buttons (no href) inside the AI Overview block. Once the page is captured, the
 """
 import asyncio
 import logging
+import random
 import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -22,15 +24,18 @@ from .browser import PagePool, PageSlot
 from .classify import HIDDEN_MARK, AioState, Classification, classify_page
 from .config import Settings
 from .goto_resolver import GotoResolution, resolve_goto
+from .netwatch import NetworkWatch
 from .parsers.registry import goto_tokens_needed
 
 log = logging.getLogger("serp.fetcher")
 
-# Runs in the page. Mirrors classify.find_aio_root so both agree on the block.
+# Runs in the page. Mirrors classify.find_aio_root so both agree on the block (an AI Overview
+# inside a People Also Ask item belongs to that question, not to the query).
 _AIO_ROOT_JS = r"""
   const aioRoot = () => {
     const head = [...document.querySelectorAll('h1,h2,[role=heading]')]
-      .find(h => (h.textContent || '').trim().toLowerCase() === 'ai overview');
+      .find(h => (h.textContent || '').trim().toLowerCase() === 'ai overview'
+                 && !h.closest('.related-question-pair'));
     if (!head) return null;
     let node = head;
     for (let i = 0; i < 8 && node.parentElement; i++) {
@@ -77,8 +82,14 @@ AIO_PROBE_JS = r"""
 # EXPAND_VERIFY_MS (all within AIO_MAX_WAIT_MS).
 MAX_EXPAND_ATTEMPTS = 3
 EXPAND_VERIFY_MS = 1500
-CLICK_TIMEOUT_MS = 1000
+# Playwright waits this long for the button to be visible, stable and unobscured
+# before a click fails. 1 s was too short on a slow live page (UK run r09: three
+# 'Locator.click: Timeout 1000ms exceeded' on a page that had fully loaded), so it
+# is a setting (AIO_CLICK_TIMEOUT_MS); the wait stays bounded by AIO_MAX_WAIT_MS.
 STABLE_S = 0.3
+# Below this many chars of innerText the AIO block is taken for the shell Google
+# sends before the answer arrives (heading + "AI Mode reply for ..." is ~40).
+AIO_SHELL_CHARS = 200
 
 
 def _pending_expanders(probe: dict, done: set[str]) -> list[dict]:
@@ -106,11 +117,16 @@ def _expansion_seen(before: dict, probe: dict) -> bool:
 # Overview, so the saved HTML says what the browser actually hid - including
 # elements hidden by a stylesheet rather than an inline style. Only the
 # classifier reads the mark; parsers ignore it.
+# A `display: contents` element has no box, so checkVisibility() is false for it
+# even though its children render; Google's AIO wraps its heading, answer and
+# sources in such elements. It counts as shown exactly when its parent is.
 MARK_HIDDEN_JS = r"""
 (mark) => {""" + _AIO_ROOT_JS + r"""
   const root = aioRoot();
   if (!root || !root.checkVisibility) return 0;
-  const shown = el => el.checkVisibility({visibilityProperty: true});
+  const shown = el => getComputedStyle(el).display === 'contents'
+    ? !el.parentElement || shown(el.parentElement)
+    : el.checkVisibility({visibilityProperty: true});
   let n = 0;
   for (const el of root.querySelectorAll('*')) {
     if (!shown(el) && (!el.parentElement || shown(el.parentElement))) { el.setAttribute(mark, ''); n++; }
@@ -242,10 +258,66 @@ class Fetcher:
                  url, res.classification.value, res.aio_state.value, res.reason, res.timings)
         return res
 
+    def _use_typed_search(self, url: str) -> bool:
+        """Typed mode applies to a query's first page only: later pages (a `start` offset)
+        are opened by URL, in the session the first page already set up."""
+        qs = parse_qs(urlsplit(url).query)
+        return self.s.search_mode == "typed" and bool(qs.get("q")) and not qs.get("start")
+
+    async def _reject_consent(self, page: Page) -> None:
+        """The "Before you continue to Google" dialog covers the homepage for a context with no
+        consent cookie (typical on UK/EU exits) and blocks the search box. Press its "Reject all"
+        button, in the page or in a consent iframe, as a visitor would; this sets the consent
+        cookie for the context. No-op when the dialog is absent."""
+        name = re.compile(r"^\s*reject all\s*$", re.I)
+        for frame in page.frames:
+            btn = frame.get_by_role("button", name=name).first
+            try:
+                if not await btn.is_visible():
+                    continue
+                await btn.click(timeout=2000)
+            except PlaywrightError:
+                continue
+            log.info("typed search: rejected consent dialog on %s", page.url)
+            try:
+                await btn.wait_for(state="hidden", timeout=3000)
+            except PlaywrightError:
+                pass
+            await page.wait_for_load_state("domcontentloaded")
+            return
+
+    async def _typed_search(self, page: Page, url: str) -> None:
+        """Google homepage -> click the search box -> type the query -> Enter. Leaves the page
+        on the results navigation; if the homepage is a /sorry/ or consent page, or has no
+        search box, it returns without typing and the caller's page classification reports it."""
+        parts = urlsplit(url)
+        qs = parse_qs(parts.query)
+        home_params = {k: qs[k][0] for k in ("hl", "gl") if qs.get(k)}
+        home = urlunsplit((parts.scheme, parts.netloc, "/", urlencode(home_params), ""))
+        timeout = self.s.nav_timeout_ms
+        await page.goto(home, wait_until="domcontentloaded", timeout=timeout)
+        if "/sorry/" in page.url or urlsplit(page.url).hostname == "consent.google.com":
+            return
+        await self._reject_consent(page)
+        box = page.locator("textarea[name='q'], input[name='q']").first
+        try:
+            await box.click(timeout=min(timeout, 5000))
+        except PlaywrightError as e:
+            log.warning("typed search: no search box on %s (%s)", page.url, str(e).splitlines()[0][:120])
+            return
+        lo, hi = sorted((self.s.typed_key_delay_min_ms, self.s.typed_key_delay_max_ms))
+        await page.keyboard.type(qs["q"][0], delay=random.randint(lo, hi))
+        await page.wait_for_timeout(random.randint(100, 300))
+        await page.keyboard.press("Enter")
+        await page.wait_for_url(re.compile(r"/search\?"), wait_until="domcontentloaded", timeout=timeout)
+
     async def _run(self, slot: PageSlot, url: str, res: FetchResult, t0: float) -> None:
         page = slot.page
-        log.info("navigate url_sent=%s", url)
-        await page.goto(url, wait_until="domcontentloaded", timeout=self.s.nav_timeout_ms)
+        log.info("navigate url_sent=%s mode=%s", url, "typed" if self._use_typed_search(url) else "url")
+        if self._use_typed_search(url):
+            await self._typed_search(page, url)
+        else:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.s.nav_timeout_ms)
         res.timings["nav_ms"] = _ms(t0)
         res.final_url = page.url
         if page.url != url:
@@ -268,7 +340,7 @@ class Fetcher:
             return
         res.timings["results_ms"] = _ms(t0)
 
-        aio_ok, aio_reason = await self._wait_aio(page)
+        aio_ok, aio_reason = await self._wait_aio(page, getattr(slot, "net", None))
         res.timings["aio_ms"] = _ms(t0)
 
         await page.evaluate(MARK_HIDDEN_JS, HIDDEN_MARK)
@@ -280,6 +352,8 @@ class Fetcher:
             res.classification, res.reason, res.aio_state = Classification.aio_incomplete, aio_reason, AioState.incomplete
         if res.classification is Classification.ok:
             await self._resolve_links(slot, res, t0)
+        if res.classification is Classification.ok and self.s.repo_state_file:
+            await page.context.storage_state(path=self.s.repo_state_file)
         await self._finish(page, res, capture=False)
 
     async def _resolve_links(self, slot: PageSlot, res: FetchResult, t0: float) -> None:
@@ -300,8 +374,13 @@ class Fetcher:
             res.classification = Classification.blocked_captcha
             res.reason = "Google answered a /goto link with its /sorry/ (unusual traffic) page"
 
-    async def _wait_aio(self, page: Page) -> tuple[bool, str]:
-        """Returns (ok, reason). ok=False only when an AI Overview is present but not finished."""
+    async def _wait_aio(self, page: Page, net: NetworkWatch | None = None) -> tuple[bool, str]:
+        """Returns (ok, reason). ok=False only when an AI Overview is present but not finished.
+
+        Google often sends the AIO block as a short shell and fills it from an
+        /async/ request (deferred AIO), so with the network watcher the block is
+        not settled while such a request is in flight, and a short block is not
+        settled until one has finished."""
         # 1) appear: poll until the AIO heading shows, up to AIO_APPEAR_WAIT_MS.
         deadline = time.perf_counter() + self.s.aio_appear_wait_ms / 1000
         probe = await page.evaluate(AIO_PROBE_JS)
@@ -325,7 +404,11 @@ class Fetcher:
             if not probe["present"]:
                 return False, "AI Overview disappeared while loading"
             now = time.perf_counter()
-            if probe["len"] != last_len or probe["busy"]:
+            # Only a shell waits on the network: a block that already has its text
+            # settles on stability, as /async/folsrch also runs on pages whose
+            # AIO is complete (and on pages without one).
+            loading = net is not None and probe["len"] < AIO_SHELL_CHARS and (bool(net.async_pending) or not net.async_done)
+            if probe["len"] != last_len or probe["busy"] or loading:
                 last_len, stable_since = probe["len"], now
             elif now - stable_since >= STABLE_S:
                 pending = _pending_expanders(probe, done)
@@ -341,7 +424,7 @@ class Fetcher:
                 remaining_ms = int((end - time.perf_counter()) * 1000)
                 clicked = False
                 try:
-                    await page.locator(f'[data-serp-btn="{bid}"]').first.click(timeout=max(1, min(CLICK_TIMEOUT_MS, remaining_ms)))
+                    await page.locator(f'[data-serp-btn="{bid}"]').first.click(timeout=max(1, min(self.s.aio_click_timeout_ms, remaining_ms)))
                     clicked = True
                 except PlaywrightError as e:
                     problem[bid] = f"click failed: {str(e).splitlines()[0][:120]}"
@@ -378,8 +461,11 @@ class Fetcher:
             out = Path(self.s.artifacts_dir) / f"{time.strftime('%Y%m%d_%H%M%S')}_{_slug(res.url_sent)}"
             out.mkdir(parents=True, exist_ok=True)
             (out / "page.html").write_text(res.html or "", encoding="utf-8")
-            try:
-                await page.screenshot(path=str(out / "screenshot.png"), full_page=True, timeout=5000)
-            except PlaywrightError as e:
-                log.warning("screenshot failed: %s", str(e).splitlines()[0])
+            # A full-page screenshot takes seconds on a results page; the HTML is
+            # enough for a page that fetched fine.
+            if res.classification is not Classification.ok or self.s.debug_screenshot_on_success:
+                try:
+                    await page.screenshot(path=str(out / "screenshot.png"), full_page=True, timeout=5000)
+                except PlaywrightError as e:
+                    log.warning("screenshot failed: %s", str(e).splitlines()[0])
             res.artifact_dir = str(out)

@@ -105,6 +105,25 @@ def test_hidden_marker_from_the_fetcher_counts_as_hidden():
     assert classify_page("https://www.google.com/search?q=x", marked).classification is Classification.ok
 
 
+def test_an_answer_in_the_dom_counts_even_if_marked_hidden():
+    # Google's AIO wraps its answer in display:contents elements, which a
+    # visibility check can miss; the answer paragraphs are still in the DOM.
+    html = """<html><body><div id="search"><div id="rso"><a href="https://e.com"><h3>E</h3></a></div>
+    <div><div data-serp-hidden><div role="heading" aria-level="2">AI Overview</div></div>
+    <div data-serp-hidden><div class="n6owBd">""" + "DNS maps names to addresses. " * 5 + """</div></div>
+    <span data-serp-hidden>An AI Overview is not available for this search</span></div></div></body></html>"""
+    v = classify_page("https://www.google.com/search?q=x", html)
+    assert v.classification is Classification.ok and v.aio_state is AioState.complete
+
+
+def test_an_ai_mode_placeholder_without_an_answer_is_not_served():
+    html = """<html><body><div id="search"><div id="rso"><a href="https://e.com"><h3>E</h3></a></div>
+    <div><div role="heading" aria-level="2">AI Overview</div><h3>AI Mode reply for t-mobile</h3>
+    <span style="display:none">An AI Overview is not available for this search</span>""" + "<script>var x=1;</script>" * 20 + """</div></div></body></html>"""
+    v = classify_page("https://www.google.com/search?q=t-mobile", html)
+    assert v.classification is Classification.aio_incomplete and "not served" in v.reason
+
+
 # --- classification + parsing + completeness, end to end -------------------------
 
 @pytest.mark.parametrize("slug", sorted(DIRECT_PAGES))

@@ -110,8 +110,9 @@ async def test_session_is_rotated_between_requests_once_too_old():
 
 async def test_ip_change_while_idle_gets_a_fresh_session_before_the_request():
     # request 1: built .1, after .1 | request 2: before .2 -> rebuilt (new session) .3, after .3
+    # (recheck 0: check before every request, even right after the previous one)
     m = manager(ips=["203.0.113.1", "203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.3"],
-                exit_ip_check_url="https://ip.example/")
+                exit_ip_check_url="https://ip.example/", exit_ip_recheck_seconds=0)
     await use(m)
     slot = await use(m)
     assert len(m.browser.contexts) == 2 and m.browser.contexts[0].closed
