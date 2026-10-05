@@ -56,6 +56,28 @@ EXPAND_VARIANTS = {
     "expands": _MORE + _REVEAL,
     "covered": _MORE + _REVEAL + _COVER,
     "inert": _MORE,
+    # The real block carries hidden progress bars of its Copy/Share buttons.
+    "hiddenbusy": '<div role="progressbar" aria-label="Copy in progress" style="display:none"></div>'
+                  '<div role="progressbar" aria-label="Sharing in progress" style="visibility:hidden"></div>',
+    # Newer layout: the overview's own "Show more" sits outside the block, far up the tree.
+    "outside": """<script>(() => { const b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.setAttribute('aria-label', 'Show more AI Overview'); b.textContent = 'Show more';
+  b.style.cssText = 'display:inline-block;padding:4px';
+  b.addEventListener('click', () => { b.style.display = 'none';
+    document.querySelector('#aio ul').insertAdjacentHTML('beforebegin', '<div role="heading" aria-level="3">Caching</div>'
+      + '<div class="n6owBd">Answers are cached for their time-to-live, so repeated lookups skip the full walk.</div>'); });
+  document.body.appendChild(b); })();</script>""",
+    # The sources' "Show all" stays covered until the overview's own (outside) "Show more" is
+    # expanded, so the outside button has to be clicked first.
+    "outside_first": """<div id="cover" style="position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:10"></div>
+<div id="all" role="button" style="position:relative;display:inline-block;padding:4px">Show all</div>
+<script>document.getElementById('all').addEventListener('click', e => { e.currentTarget.style.display = 'none'; });
+(() => { const b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.setAttribute('aria-label', 'Show more AI Overview'); b.textContent = 'Show more';
+  b.style.cssText = 'position:relative;z-index:20;display:inline-block;padding:4px';
+  b.addEventListener('click', () => { b.style.display = 'none'; document.getElementById('cover').remove(); });
+  document.body.appendChild(b); })();</script>""",
+    "visiblebusy": '<div role="progressbar" aria-label="Generating">...</div>',
 }
 
 
@@ -89,9 +111,26 @@ CONSENT_OVERLAY = """<div id="consent" style="position:fixed;inset:0;background:
 <button>Accept all</button><button onclick="document.getElementById('consent').remove()">Reject all</button></div>"""
 
 
+def _shell_page(fill_after_ms: int | None) -> str:
+    """The AI Overview as Google first sends it: the heading over an 'AI Mode reply for ...'
+    placeholder, no answer text. With fill_after_ms the answer replaces it that much later."""
+    start = PAGE.index('  <span class="tpl-hidden">')
+    end = PAGE.index("</ul>") + len("</ul>")
+    answer = PAGE[start:end].replace("<!--EXPAND-->", "")
+    fill = "" if fill_after_ms is None else (
+        f"<script>setTimeout(() => {{ const t = document.getElementById('answer');"
+        f" document.getElementById('shell').replaceWith(t.content.cloneNode(true)); }}, {fill_after_ms});</script>")
+    return (PAGE[:start] + '<div id="shell"><span>AI Mode reply for dns</span></div>'
+            + f'<template id="answer">{answer}</template>{fill}' + PAGE[end:])
+
+
 def page_for(variant: str | None) -> str:
     if variant == "contents":
         return CONTENTS_PAGE
+    if variant == "shell_late":
+        return _shell_page(1200)
+    if variant == "shell":
+        return _shell_page(None)
     return PAGE.replace("<!--EXPAND-->", EXPAND_VARIANTS.get(variant or "", ""))
 
 
@@ -237,6 +276,46 @@ async def test_show_more_that_changes_nothing_is_aio_incomplete(fake_google, bro
     out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=inert"), Fetcher(settings, manager), settings)
     assert not out.ok and out.error_code == "aio_incomplete", out.error_message
     assert "Show more" in out.error_message and "no visible change" in out.error_message
+
+
+async def test_the_overviews_own_show_more_outside_the_block_is_clicked(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=outside"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sections] == ["How it works", "Caching"]
+
+
+async def test_the_overviews_own_show_more_is_clicked_before_the_controls_it_covers(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=outside_first"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
+async def test_hidden_progress_bars_in_the_overview_do_not_keep_it_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=hiddenbusy"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
+async def test_a_visible_progress_bar_keeps_the_overview_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=visiblebusy"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete" and "not finished" in out.error_message, out.error_message
+
+
+async def test_a_placeholder_shell_is_waited_for_until_the_answer_arrives(fake_google, browsers):
+    # smoke-de q04/q45: the shell was taken as finished after ~550 ms.
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=shell_late"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sections] == ["How it works"]
+
+
+async def test_a_placeholder_shell_that_never_fills_is_reported_as_still_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=shell"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete"
+    assert "still loading after 3000 ms" in out.error_message, out.error_message
 
 
 async def test_fallback_goto_traffic_is_counted_and_marked_partial(fake_google, browsers):

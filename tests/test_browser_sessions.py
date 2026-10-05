@@ -34,8 +34,8 @@ class FakeCDP:
     def on(self, *a):
         pass
 
-    async def send(self, *a):
-        return {}
+    async def send(self, method, *a):
+        return {"frameTree": {"frame": {"id": "MAIN"}}} if method == "Page.getFrameTree" else {}
 
 
 class FakeContext:

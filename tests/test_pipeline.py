@@ -116,12 +116,12 @@ def test_an_answer_in_the_dom_counts_even_if_marked_hidden():
     assert v.classification is Classification.ok and v.aio_state is AioState.complete
 
 
-def test_an_ai_mode_placeholder_without_an_answer_is_not_served():
+def test_an_ai_mode_placeholder_without_an_answer_is_still_loading():
     html = """<html><body><div id="search"><div id="rso"><a href="https://e.com"><h3>E</h3></a></div>
     <div><div role="heading" aria-level="2">AI Overview</div><h3>AI Mode reply for t-mobile</h3>
     <span style="display:none">An AI Overview is not available for this search</span>""" + "<script>var x=1;</script>" * 20 + """</div></div></body></html>"""
     v = classify_page("https://www.google.com/search?q=t-mobile", html)
-    assert v.classification is Classification.aio_incomplete and "not served" in v.reason
+    assert v.classification is Classification.aio_incomplete and "placeholder" in v.reason
 
 
 # --- classification + parsing + completeness, end to end -------------------------

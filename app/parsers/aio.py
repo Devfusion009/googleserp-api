@@ -7,7 +7,10 @@ works" for the human-readable version of these rules):
   - Section headings: any descendant with role=heading and aria-level="3".
   - Plain paragraphs (the intro, and the closing "If you'd like..." line): elements
     with class "n6owBd" - these hold flowing prose, not bullets.
-  - Bullet lines: plain <li> elements once we're inside the response body.
+  - Bullet lines: plain <li> elements once we're inside the response body. A bullet
+    with a sub-list (e.g. "GEICO" over "Average cost: ..." / "Best for: ...") is read
+    without its sub-list, and each sub-bullet is indented two spaces per level, so
+    the sub-bullets are written once and stay under their parent.
   - The sources panel: a <li class="h7wxwc"> per source card, each holding one
     <a class="vIWmYe"> (title in aria-label; href is either the real destination
     or Google's /goto?url=<token> wrapper, resolved through ParseContext.links -
@@ -76,6 +79,26 @@ def _is_heading3(node: Node) -> bool:
     return node.attributes.get("role") == "heading" and node.attributes.get("aria-level") == "3"
 
 
+def _own_text(li: Node) -> str:
+    """A bullet's text without its nested lists (read separately, as sub-bullets)."""
+    if li.css_first("ul, ol") is None:
+        return li.text(separator=" ", strip=True)
+    copy = HTMLParser(li.html or "").css_first("li")
+    for sub in copy.css("ul, ol"):
+        sub.decompose()
+    return copy.text(separator=" ", strip=True)
+
+
+def _list_depth(li: Node, root: Node) -> int:
+    """How many bullets `li` is nested in, inside the AI Overview block."""
+    depth, node = 0, li.parent
+    while node is not None and node is not root:
+        if node.tag == "li":
+            depth += 1
+        node = node.parent
+    return depth
+
+
 def _is_product_card(link: Node | None, href: str | None) -> bool:
     """Google's shopping card in the sources panel: no href, role=button and a
     product cluster id (data-cid). Anything else without a usable link is a
@@ -124,11 +147,12 @@ def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
     sections: list[AioSection] = []
     current: AioSection | None = None
 
-    def emit(text: str | None) -> None:
+    def emit(text: str | None, prefix: str = "") -> None:
         nonlocal current
         text = clean_prose(text)
         if not text:
             return
+        text = prefix + text
         if current is None:
             intro_parts.append(text)
         else:
@@ -156,7 +180,7 @@ def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
         if node.tag == "li":
             # a bullet in the response body (not one of the source cards - those
             # were already excluded by the `break` above once we hit the panel).
-            emit("- " + (node.text(separator=" ", strip=True) or ""))
+            emit(_own_text(node), "  " * _list_depth(node, root) + "- ")
             continue
 
     for section in sections:

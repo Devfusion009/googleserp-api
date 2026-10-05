@@ -29,3 +29,12 @@ def test_a_page_with_only_a_people_also_ask_overview_has_no_overview_of_the_quer
     for n in tree.css("#main"):
         n.decompose()
     assert find_aio_root(tree) is None
+
+
+def test_a_wrapper_of_inline_scripts_next_to_the_heading_is_not_the_overview():
+    # Seen live: the heading's first large ancestor held only inline scripts; the answer sat one level up.
+    script = "<script>" + "var x = 1;" * 60 + "</script>"
+    html = (f'<html><body><div id="block"><div><div role="heading" aria-level="2">AI Overview</div>{script}</div>'
+            f'<div class="n6owBd">Nonstop flights from Shanghai to Brussels take about 12 hours.{PAD}</div></div></body></html>')
+    root = find_aio_root(HTMLParser(html))
+    assert root is not None and root.attributes.get("id") == "block"

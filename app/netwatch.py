@@ -12,11 +12,19 @@ Three jobs:
     hides the 302 of a fetch(..., {redirect: 'manual'}) once request routing is
     on (BLOCK_RESOURCES), but CDP still reports it (responseReceivedExtraInfo).
 """
+import json
+import logging
+import os
 from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, Page
 
 from .links import goto_token
+
+# TEMPORARY diagnostic (remove after the redirect-sequence run): with
+# DIAG_NAV_TRACE=1, log every Document request/response/redirect this page makes.
+_NAV_TRACE = os.environ.get("DIAG_NAV_TRACE") == "1"
+_navlog = logging.getLogger("serp.navtrace")
 
 # document: the results page itself (and any redirect hop, e.g. to /sorry/)
 # async: /async/ follow-ups - how the AI Overview (and other deferred blocks) load
@@ -76,15 +84,73 @@ class NetworkWatch:
         self._goto_urls: dict[str, str] = {}  # requestId -> /goto URL
         self._redirects: dict[str, str | None] = {}  # requestId -> Location of a 3xx answer
         self.async_pending: set[str] = set()  # /async/ requests (the AIO loads this way) not finished yet
-        self.async_done = 0  # /async/ requests finished or failed since the last reset()
+        self.async_done = 0  # /async/ requests finished or failed since the last reset() or results document
+        self._main_frame: str | None = None
 
     async def attach(self, context: BrowserContext, page: Page) -> None:
         cdp = await context.new_cdp_session(page)
+        tree = await cdp.send("Page.getFrameTree")
+        self._main_frame = tree["frameTree"]["frame"]["id"]
         cdp.on("Network.requestWillBeSent", self._on_request)
         cdp.on("Network.responseReceivedExtraInfo", self._on_response_headers)
         cdp.on("Network.loadingFinished", self._on_finished)
         cdp.on("Network.loadingFailed", self._on_failed)
+        if _NAV_TRACE:
+            self._doc_ids: set[str] = set()
+            cdp.on("Network.requestWillBeSent", self._trace_request)
+            cdp.on("Network.responseReceived", self._trace_response)
+            cdp.on("Network.responseReceivedExtraInfo", self._trace_response_headers)
+            cdp.on("Network.loadingFailed", self._trace_failed)
+            cdp.on("Network.requestWillBeSentExtraInfo", self._trace_request_headers)
         await cdp.send("Network.enable")
+
+    def _trace_request_headers(self, ev: dict) -> None:
+        # Headers as sent on the wire (cookies included). Can arrive before
+        # requestWillBeSent, so filter on the header rather than _doc_ids.
+        headers = {k.lower(): v for k, v in (ev.get("headers") or {}).items()}
+        if headers.get("sec-fetch-dest") != "document":
+            return
+        cookies = [{"name": c.get("cookie", {}).get("name"), "value": c.get("cookie", {}).get("value"),
+                    "domain": c.get("cookie", {}).get("domain"), "blocked": c.get("blockedReasons")}
+                   for c in ev.get("associatedCookies") or []]
+        _navlog.info("NAVTRACE request-headers rid=%s headers=%s cookies=%s", ev["requestId"],
+                     json.dumps(ev.get("headers") or {}), json.dumps(cookies))
+
+    def _trace_request(self, ev: dict) -> None:
+        if ev.get("type") != "Document":
+            return
+        rid = ev["requestId"]
+        self._doc_ids.add(rid)
+        redir = ev.get("redirectResponse")
+        if redir:
+            loc = {k.lower(): v for k, v in (redir.get("headers") or {}).items()}.get("location")
+            _navlog.info("NAVTRACE redirect rid=%s status=%s from=%s location=%s", rid, redir.get("status"), redir.get("url"), loc)
+        init = ev.get("initiator") or {}
+        _navlog.info("NAVTRACE request rid=%s frame=%s method=%s initiator=%s url=%s", rid, ev.get("frameId"),
+                     ev.get("request", {}).get("method"), init.get("type"), ev.get("request", {}).get("url"))
+        frames = ((init.get("stack") or {}).get("callFrames") or [])[:3]
+        _navlog.info("NAVTRACE request-context rid=%s hasUserGesture=%s referrerPolicy=%s blink_headers=%s initiator_url=%s initiator_stack=%s",
+                     rid, ev.get("hasUserGesture"), ev.get("request", {}).get("referrerPolicy"),
+                     json.dumps(ev.get("request", {}).get("headers") or {}), init.get("url"),
+                     json.dumps([{"fn": f.get("functionName"), "url": f.get("url"), "line": f.get("lineNumber")} for f in frames]))
+
+    def _trace_response(self, ev: dict) -> None:
+        if ev.get("type") != "Document":
+            return
+        r = ev.get("response") or {}
+        _navlog.info("NAVTRACE response rid=%s status=%s url=%s", ev["requestId"], r.get("status"), r.get("url"))
+
+    def _trace_response_headers(self, ev: dict) -> None:
+        if ev["requestId"] not in self._doc_ids:
+            return
+        loc = {k.lower(): v for k, v in (ev.get("headers") or {}).items()}.get("location")
+        _navlog.info("NAVTRACE response-headers rid=%s status=%s location=%s", ev["requestId"], ev.get("statusCode"), loc)
+        _navlog.info("NAVTRACE response-headers-full rid=%s status=%s headers=%s", ev["requestId"], ev.get("statusCode"),
+                     json.dumps(ev.get("headers") or {}))
+
+    def _trace_failed(self, ev: dict) -> None:
+        if ev["requestId"] in self._doc_ids:
+            _navlog.info("NAVTRACE failed rid=%s error=%s canceled=%s", ev["requestId"], ev.get("errorText"), ev.get("canceled"))
 
     def reset(self) -> None:
         self.bytes = self.requests = 0
@@ -121,6 +187,11 @@ class NetworkWatch:
             self._answered.discard(rid)
         url = ev.get("request", {}).get("url", "")
         self._sent[rid] = (url, ev.get("type"))
+        if ev.get("type") == "Document" and ev.get("frameId") == self._main_frame:
+            # A new page in the tab: /async/ requests of the page before it (the typed
+            # search's homepage makes /async/hpba ones) say nothing about this page's AIO.
+            self.async_pending.clear()
+            self.async_done = 0
         if request_kind(url, ev.get("type")) == "async":
             self.async_pending.add(rid)
         if goto_token(url, any_host=True):

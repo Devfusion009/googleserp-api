@@ -60,21 +60,35 @@ AIO_PROBE_JS = r"""
   const node = aioRoot();
   if (!node) return {present: false};
   const text = (node.innerText || '').trim();
-  const busy = !!node.querySelector('[aria-busy=true],[role=progressbar]');
   const shown = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true}) : el.offsetParent !== null;
+  // Only a visible indicator means loading: the block always carries hidden progress bars
+  // of its own Copy/Share buttons ("Copy in progress", "Sharing in progress").
+  const busy = [...node.querySelectorAll('[aria-busy=true],[role=progressbar]')].some(shown);
   const labelOf = el => (el.innerText || el.getAttribute('aria-label') || '').trim();
   const buttons = [];
-  for (const b of node.querySelectorAll('[role=button],button,[data-serp-btn]')) {
+  // Google's newer layout puts the AI Overview's own "Show more" outside the block, far up
+  // the tree; it is the button whose aria-label names it ("Show more AI Overview").
+  const own = /^show (more|all) ai overview$/i;
+  // That button goes first: until it is expanded, other controls of the block (the sources'
+  // "Show all") are covered and a click on them times out.
+  const candidates = new Set([
+    ...[...document.querySelectorAll('[role=button][aria-label],button[aria-label]')].filter(b => own.test((b.getAttribute('aria-label') || '').trim())),
+    ...node.querySelectorAll('[role=button],button,[data-serp-btn]'),
+    ...document.querySelectorAll('[data-serp-btn]')]);
+  for (const b of candidates) {
     if (b.closest('a[href]') || b.hasAttribute('href')) continue;
     const label = labelOf(b);
     if (!b.hasAttribute('data-serp-btn')) {
-      if (!['show more', 'show all'].includes(label.toLowerCase())) continue;
+      if (!['show more', 'show all'].includes(label.toLowerCase()) && !own.test((b.getAttribute('aria-label') || '').trim())) continue;
       window.__serpBtnSeq = (window.__serpBtnSeq || 0) + 1;
       b.setAttribute('data-serp-btn', String(window.__serpBtnSeq));
     }
     buttons.push({id: b.getAttribute('data-serp-btn'), label, visible: shown(b), expanded: b.getAttribute('aria-expanded')});
   }
-  return {present: true, len: text.length, busy, buttons};
+  // Answer text the parser reads (intro paragraph, section heading or bullet). The shell
+  // Google sends first ("AI Mode reply for ..." over a "Searching" skeleton) has none.
+  const answer = !!node.querySelector('.n6owBd, [role=heading][aria-level="3"], li');
+  return {present: true, len: text.length, busy, answer, buttons};
 }
 """
 
@@ -348,7 +362,8 @@ class Fetcher:
         res.final_url = page.url
         v = classify_page(page.url, res.html)
         res.classification, res.reason, res.aio_state = v.classification, v.reason, v.aio_state
-        if not aio_ok and v.classification is Classification.ok:
+        # The wait's reason says more than the classifier's (what it waited for, how long).
+        if not aio_ok and v.classification in (Classification.ok, Classification.aio_incomplete):
             res.classification, res.reason, res.aio_state = Classification.aio_incomplete, aio_reason, AioState.incomplete
         if res.classification is Classification.ok:
             await self._resolve_links(slot, res, t0)
@@ -399,15 +414,20 @@ class Fetcher:
         problem: dict[str, str] = {}  # why the last click on a control didn't count
         last_len, stable_since = -1, time.perf_counter()
         pending: list[dict] = []
+        shell = False
         while time.perf_counter() < end:
             probe = await page.evaluate(AIO_PROBE_JS)
             if not probe["present"]:
                 return False, "AI Overview disappeared while loading"
             now = time.perf_counter()
-            # Only a shell waits on the network: a block that already has its text
-            # settles on stability, as /async/folsrch also runs on pages whose
-            # AIO is complete (and on pages without one).
-            loading = net is not None and probe["len"] < AIO_SHELL_CHARS and (bool(net.async_pending) or not net.async_done)
+            # A shell with no answer text is never settled: it is still loading, whatever
+            # the network says (smoke-de q04/q45 were declared complete after ~550 ms on
+            # the placeholder, then reported as "0 chars"). A short block that has some
+            # answer waits on the network; one with its text settles on stability, as
+            # /async/folsrch also runs on pages whose AIO is complete (and without one).
+            shell = probe["len"] < AIO_SHELL_CHARS and not probe.get("answer", True)
+            loading = shell or (net is not None and probe["len"] < AIO_SHELL_CHARS
+                                and (bool(net.async_pending) or not net.async_done))
             if probe["len"] != last_len or probe["busy"] or loading:
                 last_len, stable_since = probe["len"], now
             elif now - stable_since >= STABLE_S:
@@ -440,6 +460,9 @@ class Fetcher:
                         log.warning("clicking '%s' (attempt %d) made no visible change", label, attempts[bid])
                 last_len, stable_since = -1, time.perf_counter()
             await page.wait_for_timeout(100)
+        if shell:
+            return False, (f"AI Overview still loading after {self.s.aio_max_wait_ms} ms: "
+                           "only the 'AI Mode reply' placeholder, no answer text")
         left = ", ".join(f"'{b['label']}' ({problem.get(b['id'], 'not clicked yet')})" for b in pending)
         return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms" + (f"; not expanded: {left}" if left else "")
 

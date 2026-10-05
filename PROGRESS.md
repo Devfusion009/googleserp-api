@@ -356,3 +356,35 @@ the click succeeded, so a failing "Show more"/"Show all" still returned
   request (server saw 2 hits either way). Documented; no response bytes.
 
 Tests: 183 (7 need a local Chromium; `playwright install chromium`).
+
+## Phase 10 - Germany smoke-test feedback (offline) - DONE
+
+Client feedback (2026-10-05): re-run with the expansion fixes; GEICO / Progressive /
+State Farm sub-bullets appear inside their parent bullet and again on their own.
+
+### 1. Placeholder AI Overview declared finished (smoke-de q04, q45)
+- Reported earlier as "Google served only the 'AI Mode reply' placeholder". Wrong:
+  `POCAIO wait_end ms=549` / `ms=557` - the wait ended ~0.55 s into 8 s. The q45
+  screenshot (taken ~2 s after the HTML) shows the full answer; q04's still shows
+  the "Searching" skeleton.
+- Cause: typed search loads the homepage first, whose `/async/hpba` requests set
+  `NetworkWatch.async_done`; it was never reset for the results page, so the
+  shell looked loaded and settled after 0.3 s of stable length.
+- Now: async tracking resets on every main-frame Document request (frame id from
+  `Page.getFrameTree`); a shell with no answer markup (`.n6owBd`, aria-level 3
+  heading, `li`) and < 200 chars is never settled - at the deadline it is
+  `aio_incomplete: AI Overview still loading after N ms`. The wait's reason now
+  replaces the classifier's when both say incomplete.
+
+### 2. Nested AI Overview bullets written twice
+- `parse_aio` read a parent `<li>` with its sub-list's text, then each sub-`<li>`
+  again. Now a bullet's own text excludes nested lists and sub-bullets are
+  indented two spaces per level. Same bug was in the `best_supplements_for_sleep`
+  and `t_mobile` fixtures. Germany sample saved as
+  `tests/fixtures/aio_nested/car_insurance_quotes_de.html`.
+
+Seen, not fixed: `t_mobile` bullets carry "Go to product viewer dialog for this
+item."; `best_supplements_for_sleep` "Safety Tips" ends with a GoodRx source card
+read as a bullet.
+
+Tests: 216 (all browser tests ran locally).

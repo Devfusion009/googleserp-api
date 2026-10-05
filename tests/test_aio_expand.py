@@ -44,6 +44,7 @@ class FakePage:
 
     def __init__(self, buttons):
         self.len = 1200
+        self.answer = True  # the block holds answer text (paragraph, section heading or bullet)
         self.clicks = []
         self.buttons = {str(i): {"label": label, "visible": True, "expanded": None, "on_click": list(behaviours)}
                         for i, (label, behaviours) in enumerate(buttons, 1)}
@@ -51,7 +52,7 @@ class FakePage:
     async def evaluate(self, js, *args):
         assert js == AIO_PROBE_JS
         return {
-            "present": True, "len": self.len, "busy": False,
+            "present": True, "len": self.len, "busy": False, "answer": self.answer,
             "buttons": [{"id": i, "label": b["label"], "visible": b["visible"], "expanded": b["expanded"]}
                         for i, b in self.buttons.items()],
         }
@@ -141,10 +142,43 @@ async def test_a_shell_waits_for_an_async_request_to_start_and_finish():
     assert not ok and "not finished" in reason
 
 
-async def test_a_shell_after_its_async_request_finished_is_left_to_the_classifier():
-    # The request came back without an answer: the wait ends and the classifier
-    # reports the empty block.
+async def test_a_short_answer_after_its_async_request_finished_is_left_to_the_classifier():
+    # A short block with some answer text settles once the request came back; the
+    # classifier judges whether the text is enough.
     page, net = FakePage([]), FakeNet(done=1)
     page.len = 40
     ok, reason = await fetcher()._wait_aio(page, net)
     assert ok and reason == "AI Overview complete"
+
+
+# --- the placeholder shell ("AI Mode reply for ..." over a "Searching" skeleton) ---
+
+async def test_a_placeholder_shell_is_not_settled_even_when_the_network_looks_done():
+    # smoke-de q04/q45: an /async/ request had finished (on the typed search's homepage)
+    # and the shell was declared complete after ~550 ms. Now it waits to the deadline.
+    page, net = FakePage([]), FakeNet(done=1)
+    page.len, page.answer = 40, False
+    ok, reason = await fetcher(max_wait_ms=700)._wait_aio(page, net)
+    assert not ok and "still loading after 700 ms" in reason and "placeholder" in reason
+
+
+async def test_a_placeholder_shell_without_a_network_watcher_is_not_settled():
+    page = FakePage([])
+    page.len, page.answer = 40, False
+    ok, reason = await fetcher(max_wait_ms=700)._wait_aio(page)
+    assert not ok and "still loading" in reason
+
+
+async def test_a_placeholder_shell_that_fills_in_late_is_complete():
+    page, net = FakePage([]), FakeNet(done=1)
+    page.len, page.answer = 40, False
+
+    async def answer_arrives():
+        await asyncio.sleep(1.0)
+        page.len, page.answer = 1200, True
+
+    task = asyncio.create_task(answer_arrives())
+    ok, reason = await fetcher()._wait_aio(page, net)
+    await task
+    assert ok and reason == "AI Overview complete"
+    assert page.len == 1200
