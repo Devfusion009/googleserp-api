@@ -15,6 +15,7 @@ Three jobs:
 import json
 import logging
 import os
+import time
 from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, Page
@@ -86,6 +87,10 @@ class NetworkWatch:
         self.async_pending: set[str] = set()  # /async/ requests (the AIO loads this way) not finished yet
         self.async_done = 0  # /async/ requests finished or failed since the last reset() or results document
         self._main_frame: str | None = None
+        # Scripts in flight and when one last started or ended: Google lazy-loads the code of
+        # some AI Overview controls on first use, and a click before it arrives does nothing.
+        self.scripts_pending: set[str] = set()
+        self.script_activity = 0.0
 
     async def attach(self, context: BrowserContext, page: Page) -> None:
         cdp = await context.new_cdp_session(page)
@@ -162,8 +167,17 @@ class NetworkWatch:
         self._redirects.clear()
         self.async_pending.clear()
         self.async_done = 0
+        self.scripts_pending.clear()
+        self.script_activity = 0.0
+
+    def scripts_quiet(self, idle_s: float) -> bool:
+        """No script in flight, and none started or ended in the last idle_s seconds."""
+        return not self.scripts_pending and time.monotonic() - self.script_activity >= idle_s
 
     def _async_ended(self, request_id: str) -> None:
+        if request_id in self.scripts_pending:
+            self.scripts_pending.discard(request_id)
+            self.script_activity = time.monotonic()
         if request_id in self.async_pending:
             self.async_pending.discard(request_id)
             self.async_done += 1
@@ -194,6 +208,9 @@ class NetworkWatch:
             self.async_done = 0
         if request_kind(url, ev.get("type")) == "async":
             self.async_pending.add(rid)
+        if ev.get("type") == "Script":
+            self.scripts_pending.add(rid)
+            self.script_activity = time.monotonic()
         if goto_token(url, any_host=True):
             self._goto_urls.setdefault(rid, url)
         if rid in self._answered:  # its response headers arrived first

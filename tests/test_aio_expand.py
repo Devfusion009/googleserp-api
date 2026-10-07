@@ -182,3 +182,70 @@ async def test_a_placeholder_shell_that_fills_in_late_is_complete():
     await task
     assert ok and reason == "AI Overview complete"
     assert page.len == 1200
+
+
+# --- controls whose code Google lazy-loads (mobile run 2026-10-05, "how does dns work") ---
+
+class ScriptNet(FakeNet):
+    """FakeNet plus the script tracking _wait_aio reads."""
+
+    def __init__(self):
+        super().__init__(done=1)
+        self.scripts_pending: set[str] = set()
+        self.loaded_at = 0.0
+
+    def scripts_quiet(self, idle_s):
+        import time
+        return not self.scripts_pending and time.monotonic() - self.loaded_at >= idle_s
+
+
+async def test_a_click_while_scripts_load_is_awaited_not_repeated():
+    # Clicked while the control's code is loading: the effect shows once the scripts are
+    # in. One click, no "no visible change" retry that could toggle it back.
+    page, net = FakePage([("Show all", ["nothing"] * 3)]), ScriptNet()
+    net.scripts_pending = {"s1"}
+
+    async def scripts_arrive():
+        import time
+        await asyncio.sleep(2.5)  # well past EXPAND_VERIFY_MS
+        net.scripts_pending.clear(); net.loaded_at = time.monotonic()
+        page.buttons["1"]["visible"] = False  # the queued click takes effect
+        page.len += 500
+
+    task = asyncio.create_task(scripts_arrive())
+    ok, reason = await fetcher(max_wait_ms=6000)._wait_aio(page, net)
+    await task
+    assert ok, reason
+    assert page.clicks == ["1"]
+
+
+async def test_a_click_waits_for_scripts_to_go_quiet_first():
+    page, net = FakePage([("Show all", ["hide"])]), ScriptNet()
+    net.scripts_pending = {"s1"}
+    clicked_while_loading = []
+    real_locator = page.locator
+
+    def locator(selector):
+        clicked_while_loading.append(bool(net.scripts_pending))
+        return real_locator(selector)
+
+    page.locator = locator
+
+    async def scripts_arrive():
+        import time
+        await asyncio.sleep(0.8)
+        net.scripts_pending.clear(); net.loaded_at = time.monotonic()
+
+    task = asyncio.create_task(scripts_arrive())
+    ok, reason = await fetcher(max_wait_ms=6000)._wait_aio(page, net)
+    await task
+    assert ok, reason
+    assert clicked_while_loading == [False]
+
+
+async def test_scripts_that_never_go_quiet_do_not_block_the_click():
+    page, net = FakePage([("Show more", ["hide"])]), ScriptNet()
+    net.scripts_pending = {"forever"}
+    ok, reason = await fetcher(max_wait_ms=6000)._wait_aio(page, net)
+    assert ok, reason
+    assert page.clicks == ["1"]

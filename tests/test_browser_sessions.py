@@ -1,7 +1,7 @@
 """Proxy sessions and exit-IP changes in BrowserManager, with a fake browser."""
 import pytest
 
-from app.browser import BrowserManager, Slot, parse_ip
+from app.browser import BrowserManager, Slot, parse_exit_check, parse_ip
 from app.config import Settings
 from app.proxy import StaticProxy
 
@@ -148,3 +148,46 @@ async def test_a_failed_ip_check_is_unknown_not_a_change():
 ])
 def test_parse_ip(text, ip):
     assert parse_ip(text) == ip
+
+
+# --- timezone matched to the exit IP ---------------------------------------------
+
+def test_exit_check_answers_give_ip_and_timezone():
+    assert parse_exit_check('{"ip": "172.56.90.213", "city": "Dallas", "loc": "32.78,-96.80", "timezone": "America/Chicago"}') \
+        == ("172.56.90.213", "America/Chicago")  # ipinfo.io/json
+    assert parse_exit_check('{"timezone":"America/Los_Angeles","query":"172.56.127.192"}') == ("172.56.127.192", "America/Los_Angeles")  # ip-api
+    assert parse_exit_check('{"ip": "203.0.113.5", "timezone": {"id": "Europe/Berlin"}}') == ("203.0.113.5", "Europe/Berlin")  # ipwho.is
+    assert parse_exit_check("203.0.113.7\n") == ("203.0.113.7", None)  # ipify: no timezone
+    assert parse_exit_check('{"ip": "203.0.113.7", "timezone": "Mars/Olympus"}') == ("203.0.113.7", None)  # unknown name
+    assert parse_exit_check('{"ip": "203.0.113.7", "timezone": "../../etc/passwd"}') == ("203.0.113.7", None)
+
+
+async def test_a_new_context_takes_the_exit_ips_timezone_on_the_same_session():
+    m = manager(ips=['{"ip": "203.0.113.1", "timezone": "America/Chicago"}', "203.0.113.1"], exit_ip_check_url="https://ip.example/")
+    slot = await use(m)
+    probe, live = m.browser.contexts
+    assert probe.closed and "timezone_id" not in probe.opts
+    assert live.opts["timezone_id"] == "America/Chicago" and not live.closed
+    assert probe.opts["proxy"] == live.opts["proxy"]  # same sticky session, so the same exit IP
+    assert slot.report["timezone"] == "America/Chicago" and slot.report["exit_ip"] == "203.0.113.1"
+    assert slot.report["ip_checks"] == 2  # the check while building + the one after the request
+
+
+async def test_without_a_timezone_from_the_check_the_fixed_one_is_used_and_nothing_is_rebuilt():
+    m = manager(ips=["203.0.113.1", "203.0.113.1"], exit_ip_check_url="https://ip.example/", timezone_id="America/New_York")
+    slot = await use(m)
+    assert len(m.browser.contexts) == 1 and m.browser.contexts[0].opts["timezone_id"] == "America/New_York"
+    assert slot.report["timezone"] == "America/New_York"
+
+
+async def test_timezone_matching_can_be_turned_off():
+    m = manager(ips=['{"ip": "203.0.113.1", "timezone": "America/Chicago"}', "203.0.113.1"],
+                exit_ip_check_url="https://ip.example/", timezone_from_exit_ip=False)
+    await use(m)
+    assert len(m.browser.contexts) == 1 and "timezone_id" not in m.browser.contexts[0].opts
+
+
+async def test_an_unknown_fixed_timezone_is_ignored():
+    m = manager(timezone_id="Not/AZone")
+    await use(m)
+    assert "timezone_id" not in m.browser.contexts[0].opts

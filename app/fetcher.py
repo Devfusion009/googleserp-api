@@ -96,6 +96,15 @@ AIO_PROBE_JS = r"""
 # EXPAND_VERIFY_MS (all within AIO_MAX_WAIT_MS).
 MAX_EXPAND_ATTEMPTS = 3
 EXPAND_VERIFY_MS = 1500
+# Google lazy-loads the code behind some AI Overview controls: after "Show more", the
+# sources' "Show all" works only once a burst of xjs / search-next scripts has arrived
+# (mobile run 2026-10-05: two clicks made no change, the third worked 11 ms after the
+# scripts finished). So a click waits, up to SCRIPT_QUIET_MAX_MS, for the page's scripts
+# to go quiet (none in flight, none for SCRIPT_IDLE_S), and a click's effect is awaited
+# past EXPAND_VERIFY_MS for as long as scripts are still loading - re-clicking then could
+# be queued and replayed as a second toggle.
+SCRIPT_IDLE_S = 0.5
+SCRIPT_QUIET_MAX_MS = 2500
 # Playwright waits this long for the button to be visible, stable and unobscured
 # before a click fails. 1 s was too short on a slow live page (UK run r09: three
 # 'Locator.click: Timeout 1000ms exceeded' on a page that had fully loaded), so it
@@ -440,6 +449,7 @@ class Fetcher:
                 if attempts.get(bid, 0) >= MAX_EXPAND_ATTEMPTS:
                     return False, f"could not expand '{label}' after {MAX_EXPAND_ATTEMPTS} attempts ({problem.get(bid, 'no visible change')})"
                 attempts[bid] = attempts.get(bid, 0) + 1
+                await self._wait_scripts_quiet(page, net, end)
                 before_url = page.url
                 remaining_ms = int((end - time.perf_counter()) * 1000)
                 clicked = False
@@ -452,7 +462,7 @@ class Fetcher:
                 if page.url != before_url:  # also when the click raised part-way
                     return False, f"clicking '{label}' navigated away"
                 if clicked:
-                    if await self._expansion_verified(page, {**button, "len_before": probe["len"]}, end):
+                    if await self._expansion_verified(page, {**button, "len_before": probe["len"]}, end, net):
                         done.add(bid)
                         problem.pop(bid, None)
                     else:
@@ -466,14 +476,23 @@ class Fetcher:
         left = ", ".join(f"'{b['label']}' ({problem.get(b['id'], 'not clicked yet')})" for b in pending)
         return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms" + (f"; not expanded: {left}" if left else "")
 
-    async def _expansion_verified(self, page: Page, button: dict, end: float) -> bool:
-        """Poll until the page shows that clicking `button` expanded something,
-        for up to EXPAND_VERIFY_MS (never past `end`)."""
+    async def _wait_scripts_quiet(self, page: Page, net: NetworkWatch | None, end: float) -> None:
+        """Before a click: let lazily loaded scripts arrive, up to SCRIPT_QUIET_MAX_MS (never past `end`)."""
+        if net is None:
+            return
+        until = min(end, time.perf_counter() + SCRIPT_QUIET_MAX_MS / 1000)
+        while not net.scripts_quiet(SCRIPT_IDLE_S) and time.perf_counter() < until:
+            await page.wait_for_timeout(100)
+
+    async def _expansion_verified(self, page: Page, button: dict, end: float, net: NetworkWatch | None = None) -> bool:
+        """Poll until the page shows that clicking `button` expanded something, for up
+        to EXPAND_VERIFY_MS, longer while scripts are still loading (never past `end`)."""
         until = min(end, time.perf_counter() + EXPAND_VERIFY_MS / 1000)
         while True:
             if _expansion_seen(button, await page.evaluate(AIO_PROBE_JS)):
                 return True
-            if time.perf_counter() >= until:
+            now = time.perf_counter()
+            if now >= end or (now >= until and (net is None or net.scripts_quiet(SCRIPT_IDLE_S))):
                 return False
             await page.wait_for_timeout(100)
 

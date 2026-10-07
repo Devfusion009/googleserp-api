@@ -33,3 +33,13 @@ def test_a_document_in_an_iframe_does_not_reset_async_tracking():
     request(net, "2", "https://www.google.com/async/folsrch", "XHR")
     request(net, "3", "https://www.google.com/recaptcha/frame", "Document", frame=IFRAME)
     assert net.async_pending == {"2"}
+
+
+def test_scripts_in_flight_keep_the_page_from_being_quiet():
+    net = watch()
+    request(net, "1", "https://www.google.com/search?q=dns", "Document")
+    assert net.scripts_quiet(0)
+    request(net, "2", "https://www.gstatic.com/_/mss/search-next/_/js/k=x", "Script")
+    assert not net.scripts_quiet(0)
+    net._on_finished({"requestId": "2", "encodedDataLength": 100})
+    assert net.scripts_quiet(0) and not net.scripts_quiet(60)  # finished just now
