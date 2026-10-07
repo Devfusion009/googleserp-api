@@ -423,3 +423,17 @@ page access 3/60 (5%), fully valid 2/60, CAPTCHA 57/60. Report:
 
 Success screenshots were off in the mobile run (runner now defaults
 DEBUG_SCREENSHOT_ON_SUCCESS=true). Tests: 227.
+
+## Phase 12 - US VM (offline checks only)
+
+- New VM `serp-vm2` (t3.large, us-east-1, Ubuntu 24.04, Chrome 155, Xvfb). SSH by public
+  IP kept failing because the local (mobile) public IP changes every few minutes; access is
+  through an EC2 Instance Connect Endpoint instead (`poc/rebrowser/vm/deploy.sh i-...`).
+- selectolax 1.0 removed the Modest parser (`selectolax.parser`): a fresh install broke
+  all parser imports. Pinned `selectolax<1.0`.
+- Leak check (`poc/rebrowser/vm/leak_check.py`, no Google search): real Chrome with only
+  per-context proxies made 7 direct connections to Google from the VM's own IP (push
+  messaging :5228, component updates, sign-in). The POC runner was not affected (it sets
+  a launch-level proxy). The app now gives Chrome a dead browser-wide proxy
+  (`LAUNCH_PROXY=http://127.0.0.1:9`) when a proxy is configured: re-check showed only
+  the proxy endpoint. Page timezone through a mobile line: America/Chicago (exit IP's).
