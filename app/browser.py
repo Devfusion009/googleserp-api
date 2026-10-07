@@ -172,6 +172,8 @@ class BrowserManager:
             kwargs["executable_path"] = self.s.browser_executable_path
         if self.s.repo_fingerprint:
             kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+        if self.s.proxy_mode != "none" and self.s.launch_proxy:
+            kwargs["proxy"] = {"server": self.s.launch_proxy}  # see Settings.launch_proxy
         self.browser = await self._pw.chromium.launch(**kwargs)
         for i in range(max(1, self.s.concurrency)):
             self._slots.put_nowait(Slot(i))

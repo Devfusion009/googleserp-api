@@ -191,3 +191,43 @@ async def test_an_unknown_fixed_timezone_is_ignored():
     m = manager(timezone_id="Not/AZone")
     await use(m)
     assert "timezone_id" not in m.browser.contexts[0].opts
+
+
+# --- browser-wide proxy: Chrome's own background traffic never leaves directly ----
+
+class FakeChromium:
+    def __init__(self):
+        self.kwargs = None
+
+    async def launch(self, **kwargs):
+        self.kwargs = kwargs
+        return FakeBrowser()
+
+
+class FakePlaywright:
+    def __init__(self):
+        self.chromium = FakeChromium()
+
+
+async def _launch_kwargs(monkeypatch, **settings):
+    import app.browser as b
+    pw = FakePlaywright()
+
+    class Starter:
+        async def start(self):
+            return pw
+
+    monkeypatch.setattr(b, "async_playwright", lambda: Starter())
+    s = Settings(_env_file=None, prewarm_slots=False, **settings)
+    await BrowserManager(s, StaticProxy(PROXY)).start()
+    return pw.chromium.kwargs
+
+
+async def test_with_a_proxy_the_browser_wide_proxy_is_a_dead_end(monkeypatch):
+    kw = await _launch_kwargs(monkeypatch, proxy_mode="static", proxy_url=PROXY)
+    assert kw["proxy"] == {"server": "http://127.0.0.1:9"}
+
+
+async def test_without_a_proxy_or_with_it_turned_off_there_is_no_browser_wide_proxy(monkeypatch):
+    assert "proxy" not in await _launch_kwargs(monkeypatch)
+    assert "proxy" not in await _launch_kwargs(monkeypatch, proxy_mode="static", proxy_url=PROXY, launch_proxy="")

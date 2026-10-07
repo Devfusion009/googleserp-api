@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # EXIT_IP_CHECK_URL must return JSON with a "timezone" (e.g. https://ipinfo.io/json);
     # TIMEZONE_ID (an IANA name, e.g. America/Chicago) is used when the check gives none.
     timezone_from_exit_ip: bool = True
+    # Browser-wide proxy when PROXY_MODE is not none. Page traffic uses each context's own
+    # proxy, but Chrome's background services (push messaging :5228, component updates,
+    # sign-in checks) use the browser-wide one - with none they went straight out from the
+    # host's IP (leak check on the US VM: 7 direct Google connections). A dead address makes
+    # them fail instead. Empty = no browser-wide proxy.
+    launch_proxy: str = "http://127.0.0.1:9"
     timezone_id: str = ""
     # Build each slot's context (and run its first exit-IP check) at startup, so
     # the first request doesn't pay for it.
