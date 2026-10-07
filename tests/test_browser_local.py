@@ -56,7 +56,37 @@ EXPAND_VARIANTS = {
     "expands": _MORE + _REVEAL,
     "covered": _MORE + _REVEAL + _COVER,
     "inert": _MORE,
+    # The real block carries hidden progress bars of its Copy/Share buttons.
+    "hiddenbusy": '<div role="progressbar" aria-label="Copy in progress" style="display:none"></div>'
+                  '<div role="progressbar" aria-label="Sharing in progress" style="visibility:hidden"></div>',
+    # Newer layout: the overview's own "Show more" sits outside the block, far up the tree.
+    "outside": """<script>(() => { const b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.setAttribute('aria-label', 'Show more AI Overview'); b.textContent = 'Show more';
+  b.style.cssText = 'display:inline-block;padding:4px';
+  b.addEventListener('click', () => { b.style.display = 'none';
+    document.querySelector('#aio ul').insertAdjacentHTML('beforebegin', '<div role="heading" aria-level="3">Caching</div>'
+      + '<div class="n6owBd">Answers are cached for their time-to-live, so repeated lookups skip the full walk.</div>'); });
+  document.body.appendChild(b); })();</script>""",
+    # The sources' "Show all" stays covered until the overview's own (outside) "Show more" is
+    # expanded, so the outside button has to be clicked first.
+    "outside_first": """<div id="cover" style="position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:10"></div>
+<div id="all" role="button" style="position:relative;display:inline-block;padding:4px">Show all</div>
+<script>document.getElementById('all').addEventListener('click', e => { e.currentTarget.style.display = 'none'; });
+(() => { const b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.setAttribute('aria-label', 'Show more AI Overview'); b.textContent = 'Show more';
+  b.style.cssText = 'position:relative;z-index:20;display:inline-block;padding:4px';
+  b.addEventListener('click', () => { b.style.display = 'none'; document.getElementById('cover').remove(); });
+  document.body.appendChild(b); })();</script>""",
+    "visiblebusy": '<div role="progressbar" aria-label="Generating">...</div>',
+    # Like Google after "Show more": the sources' "Show all" works only once a lazily loaded
+    # script (served 4.5 s late, about what the mobile run saw) has attached its handler; a click before that does nothing.
+    "lazy": _MORE + """<div id="all" role="button" style="display:inline-block;padding:4px">Show all</div>
+<script>document.getElementById('more').addEventListener('click', e => {
+  e.currentTarget.style.display = 'none';
+  const s = document.createElement('script'); s.src = '/lazy.js'; document.body.appendChild(s);
+});</script>""",
 }
+LAZY_JS = b"document.getElementById('all').addEventListener('click', e => { e.currentTarget.style.display = 'none'; window.__allClicks = (window.__allClicks || 0) + 1; });"
 
 
 # Google's newer AIO layout wraps the heading, the answer and the source list in
@@ -89,9 +119,26 @@ CONSENT_OVERLAY = """<div id="consent" style="position:fixed;inset:0;background:
 <button>Accept all</button><button onclick="document.getElementById('consent').remove()">Reject all</button></div>"""
 
 
+def _shell_page(fill_after_ms: int | None) -> str:
+    """The AI Overview as Google first sends it: the heading over an 'AI Mode reply for ...'
+    placeholder, no answer text. With fill_after_ms the answer replaces it that much later."""
+    start = PAGE.index('  <span class="tpl-hidden">')
+    end = PAGE.index("</ul>") + len("</ul>")
+    answer = PAGE[start:end].replace("<!--EXPAND-->", "")
+    fill = "" if fill_after_ms is None else (
+        f"<script>setTimeout(() => {{ const t = document.getElementById('answer');"
+        f" document.getElementById('shell').replaceWith(t.content.cloneNode(true)); }}, {fill_after_ms});</script>")
+    return (PAGE[:start] + '<div id="shell"><span>AI Mode reply for dns</span></div>'
+            + f'<template id="answer">{answer}</template>{fill}' + PAGE[end:])
+
+
 def page_for(variant: str | None) -> str:
     if variant == "contents":
         return CONTENTS_PAGE
+    if variant == "shell_late":
+        return _shell_page(1200)
+    if variant == "shell":
+        return _shell_page(None)
     return PAGE.replace("<!--EXPAND-->", EXPAND_VARIANTS.get(variant or "", ""))
 
 
@@ -141,9 +188,15 @@ class FakeGoogle(BaseHTTPRequestHandler):
             type(self).home_hits += 1
             home = HOME.replace("</body>", CONSENT_OVERLAY + "</body>") if self.consent_on_home else HOME
             return self._send(200, home.encode(), [("Content-Type", "text/html; charset=utf-8")])
+        if parts.path == "/ipjson":  # like https://ipinfo.io/json
+            body = b'{"ip": "203.0.113.7", "city": "Chicago", "timezone": "America/Chicago"}'
+            return self._send(200, body, [("Content-Type", "application/json")])
         if parts.path == "/ip":
             type(self).ip_hits += 1
             return self._send(200, b"203.0.113.7", [("Content-Type", "text/plain")])
+        if parts.path == "/lazy.js":
+            time.sleep(4.5)  # longer than three 1.5 s click checks
+            return self._send(200, LAZY_JS, [("Content-Type", "text/javascript")])
         if parts.path == "/image.png":
             type(self).image_hits += 1
         return self._send(404)
@@ -239,6 +292,54 @@ async def test_show_more_that_changes_nothing_is_aio_incomplete(fake_google, bro
     assert "Show more" in out.error_message and "no visible change" in out.error_message
 
 
+async def test_the_overviews_own_show_more_outside_the_block_is_clicked(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=outside"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sections] == ["How it works", "Caching"]
+
+
+async def test_the_overviews_own_show_more_is_clicked_before_the_controls_it_covers(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=outside_first"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
+async def test_hidden_progress_bars_in_the_overview_do_not_keep_it_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=hiddenbusy"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
+async def test_a_visible_progress_bar_keeps_the_overview_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=visiblebusy"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete" and "not finished" in out.error_message, out.error_message
+
+
+async def test_a_placeholder_shell_is_waited_for_until_the_answer_arrives(fake_google, browsers):
+    # smoke-de q04/q45: the shell was taken as finished after ~550 ms.
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=shell_late"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sections] == ["How it works"]
+
+
+async def test_a_placeholder_shell_that_never_fills_is_reported_as_still_loading(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=shell"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete"
+    assert "still loading after 3000 ms" in out.error_message, out.error_message
+
+
+async def test_a_control_whose_code_loads_late_is_clicked_once_it_has_loaded(fake_google, browsers):
+    # Mobile run 2026-10-05: "Show all" clicked before its script arrived made no change twice.
+    settings, manager = browsers
+    settings.aio_max_wait_ms = 8000
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=lazy"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
 async def test_fallback_goto_traffic_is_counted_and_marked_partial(fake_google, browsers):
     # Two links can't be resolved in the page, so they go through the request
     # client outside the browser - whose traffic CDP never sees.
@@ -298,6 +399,20 @@ async def test_recheck_zero_checks_before_every_request(fake_google):
     try:
         await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns"), Fetcher(settings, manager), settings)
         assert FakeGoogle.ip_hits == 3  # startup + before + after
+    finally:
+        await manager.stop()
+
+
+async def test_the_page_reports_the_exit_ips_timezone_not_the_hosts(fake_google):
+    # Mobile run: US exit IPs, but every page said Asia/Kolkata (the host's timezone).
+    settings, manager = await _manager(exit_ip_check_url=f"{fake_google}/ipjson", debug_artifacts=False)
+    try:
+        async with manager.page("US", "en") as slot:
+            await slot.page.goto(f"{fake_google}/")
+            tz = await slot.page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone")
+            offset = await slot.page.evaluate("new Date(2026, 0, 15).getTimezoneOffset()")
+        assert tz == "America/Chicago" and offset == 360  # CST, UTC-6
+        assert slot.report["timezone"] == "America/Chicago"
     finally:
         await manager.stop()
 

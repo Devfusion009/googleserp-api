@@ -17,9 +17,16 @@ to another:
     (X-Proxy-Session, benchmark report) and the next request gets a fresh
     session. The request itself is judged on what Google returned - a page
     broken by the switch fails like any other, and is not retried.
+
+Timezone. A context's timezone can only be set when it is created, and the exit
+IP (whose timezone it should match) is only known once the context exists. So
+a new context is checked first; if the check names a timezone, that context is
+closed unused and built again on the same proxy URL (same sticky session) with
+it, before any page is opened.
 """
 import asyncio
 import ipaddress
+import json
 import logging
 import re
 import secrets
@@ -28,6 +35,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncContextManager, Protocol
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 
@@ -96,6 +104,8 @@ class Slot:
     retire: str | None = None
     report: dict = field(default_factory=dict)
     ip_checked_at: float | None = None  # monotonic time of the last exit-IP check that answered
+    exit_tz: str | None = None  # timezone named by the last exit-IP check
+    timezone: str | None = None  # the context's timezone (None: the host's)
 
 
 def locale_for(country: str | None, language: str | None) -> str:
@@ -115,6 +125,34 @@ def parse_ip(text: str) -> str | None:
         except ValueError:
             continue
     return None
+
+
+def valid_timezone(name) -> str | None:
+    """`name` if it is an IANA timezone this machine knows (Chromium rejects others)."""
+    if not isinstance(name, str) or not name or name.startswith(("/", ".")) or ".." in name:
+        return None
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return None
+    return name
+
+
+def parse_exit_check(text: str) -> tuple[str | None, str | None]:
+    """(exit IP, timezone) from an IP-check answer: JSON such as ipinfo.io/json
+    ({"ip", "timezone"}), ip-api.com ({"query", "timezone"}) or ipwho.is
+    ({"ip", "timezone": {"id"}}), or plain text with just the IP."""
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        ip = next((parse_ip(str(data[k])) for k in ("ip", "query", "ip_address") if data.get(k)), None)
+        tz = data.get("timezone")
+        if isinstance(tz, dict):
+            tz = tz.get("id") or tz.get("name")
+        return ip or parse_ip(text), valid_timezone(tz)
+    return parse_ip(text), None
 
 
 class BrowserManager:
@@ -184,9 +222,9 @@ class BrowserManager:
         slot.report["ip_checks"] = slot.report.get("ip_checks", 0) + 1
         try:
             resp = await slot.context.request.get(self.s.exit_ip_check_url, timeout=self.s.exit_ip_check_timeout_ms)
-            ip = parse_ip(await resp.text()) if resp.ok else None
+            ip, tz = parse_exit_check(await resp.text()) if resp.ok else (None, None)
             if ip:
-                slot.ip_checked_at = time.monotonic()
+                slot.ip_checked_at, slot.exit_tz = time.monotonic(), tz
         except Exception as e:  # a failed check is "unknown", never a reason to fail the request
             log.warning("slot=%d exit IP check failed: %s", slot.index, str(e).splitlines()[0][:200])
             return None
@@ -220,7 +258,25 @@ class BrowserManager:
         state = self.s.repo_state_file
         if state and Path(state).exists():
             opts["storage_state"] = state
+        fixed_tz = valid_timezone(self.s.timezone_id)
+        if self.s.timezone_id and not fixed_tz:
+            log.warning("TIMEZONE_ID=%r is not a known IANA timezone; ignored", self.s.timezone_id)
+        if fixed_tz:
+            opts["timezone_id"] = fixed_tz
         slot.context = await self.browser.new_context(**opts)
+        slot.exit_tz = None
+        slot.exit_ip = await self.exit_ip(slot)
+        tz = (slot.exit_tz if self.s.timezone_from_exit_ip else None) or fixed_tz
+        if tz and tz != opts.get("timezone_id"):
+            # Nothing has been opened in this context yet; build it again, same proxy
+            # URL (same sticky session, so the same exit IP), with the exit's timezone.
+            await slot.context.close()
+            opts["timezone_id"] = tz
+            slot.context = await self.browser.new_context(**opts)
+        elif self.s.timezone_from_exit_ip and self.s.exit_ip_check_url and slot.exit_ip and not slot.exit_tz:
+            log.warning("slot=%d exit-IP check named no timezone (EXIT_IP_CHECK_URL should return JSON with one, "
+                        "e.g. https://ipinfo.io/json); timezone: %s", slot.index, fixed_tz or "the host's")
+        slot.timezone = opts.get("timezone_id")
         if self.s.repo_fingerprint:
             await slot.context.add_init_script(REPO_FINGERPRINT_JS)
         if self.s.block_resources:
@@ -230,7 +286,6 @@ class BrowserManager:
         await slot.net.attach(slot.context, slot.page)
         slot.proxy_template, slot.proxy, slot.locale = template, proxy, locale
         slot.created, slot.retire = time.monotonic(), None
-        slot.exit_ip = await self.exit_ip(slot)
 
     def _rebuild_reason(self, slot: Slot, template: str | None, locale: str) -> str | None:
         if slot.context is None:
@@ -262,9 +317,9 @@ class BrowserManager:
                 await self._build(slot, template, locale)
             elif ip:
                 slot.exit_ip = ip
-        slot.report.update(session=slot.session, exit_ip=slot.exit_ip)
-        log.info("slot=%d proxy=%s session=%s exit_ip=%s locale=%s",
-                 slot.index, mask_proxy(slot.proxy), slot.session, slot.exit_ip, slot.locale)
+        slot.report.update(session=slot.session, exit_ip=slot.exit_ip, timezone=slot.timezone)
+        log.info("slot=%d proxy=%s session=%s exit_ip=%s locale=%s timezone=%s",
+                 slot.index, mask_proxy(slot.proxy), slot.session, slot.exit_ip, slot.locale, slot.timezone)
 
     def _ip_checked_recently(self, slot: Slot) -> bool:
         recheck = self.s.exit_ip_recheck_seconds

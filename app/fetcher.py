@@ -60,21 +60,35 @@ AIO_PROBE_JS = r"""
   const node = aioRoot();
   if (!node) return {present: false};
   const text = (node.innerText || '').trim();
-  const busy = !!node.querySelector('[aria-busy=true],[role=progressbar]');
   const shown = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true}) : el.offsetParent !== null;
+  // Only a visible indicator means loading: the block always carries hidden progress bars
+  // of its own Copy/Share buttons ("Copy in progress", "Sharing in progress").
+  const busy = [...node.querySelectorAll('[aria-busy=true],[role=progressbar]')].some(shown);
   const labelOf = el => (el.innerText || el.getAttribute('aria-label') || '').trim();
   const buttons = [];
-  for (const b of node.querySelectorAll('[role=button],button,[data-serp-btn]')) {
+  // Google's newer layout puts the AI Overview's own "Show more" outside the block, far up
+  // the tree; it is the button whose aria-label names it ("Show more AI Overview").
+  const own = /^show (more|all) ai overview$/i;
+  // That button goes first: until it is expanded, other controls of the block (the sources'
+  // "Show all") are covered and a click on them times out.
+  const candidates = new Set([
+    ...[...document.querySelectorAll('[role=button][aria-label],button[aria-label]')].filter(b => own.test((b.getAttribute('aria-label') || '').trim())),
+    ...node.querySelectorAll('[role=button],button,[data-serp-btn]'),
+    ...document.querySelectorAll('[data-serp-btn]')]);
+  for (const b of candidates) {
     if (b.closest('a[href]') || b.hasAttribute('href')) continue;
     const label = labelOf(b);
     if (!b.hasAttribute('data-serp-btn')) {
-      if (!['show more', 'show all'].includes(label.toLowerCase())) continue;
+      if (!['show more', 'show all'].includes(label.toLowerCase()) && !own.test((b.getAttribute('aria-label') || '').trim())) continue;
       window.__serpBtnSeq = (window.__serpBtnSeq || 0) + 1;
       b.setAttribute('data-serp-btn', String(window.__serpBtnSeq));
     }
     buttons.push({id: b.getAttribute('data-serp-btn'), label, visible: shown(b), expanded: b.getAttribute('aria-expanded')});
   }
-  return {present: true, len: text.length, busy, buttons};
+  // Answer text the parser reads (intro paragraph, section heading or bullet). The shell
+  // Google sends first ("AI Mode reply for ..." over a "Searching" skeleton) has none.
+  const answer = !!node.querySelector('.n6owBd, [role=heading][aria-level="3"], li');
+  return {present: true, len: text.length, busy, answer, buttons};
 }
 """
 
@@ -82,6 +96,15 @@ AIO_PROBE_JS = r"""
 # EXPAND_VERIFY_MS (all within AIO_MAX_WAIT_MS).
 MAX_EXPAND_ATTEMPTS = 3
 EXPAND_VERIFY_MS = 1500
+# Google lazy-loads the code behind some AI Overview controls: after "Show more", the
+# sources' "Show all" works only once a burst of xjs / search-next scripts has arrived
+# (mobile run 2026-10-05: two clicks made no change, the third worked 11 ms after the
+# scripts finished). So a click waits, up to SCRIPT_QUIET_MAX_MS, for the page's scripts
+# to go quiet (none in flight, none for SCRIPT_IDLE_S), and a click's effect is awaited
+# past EXPAND_VERIFY_MS for as long as scripts are still loading - re-clicking then could
+# be queued and replayed as a second toggle.
+SCRIPT_IDLE_S = 0.5
+SCRIPT_QUIET_MAX_MS = 2500
 # Playwright waits this long for the button to be visible, stable and unobscured
 # before a click fails. 1 s was too short on a slow live page (UK run r09: three
 # 'Locator.click: Timeout 1000ms exceeded' on a page that had fully loaded), so it
@@ -348,7 +371,8 @@ class Fetcher:
         res.final_url = page.url
         v = classify_page(page.url, res.html)
         res.classification, res.reason, res.aio_state = v.classification, v.reason, v.aio_state
-        if not aio_ok and v.classification is Classification.ok:
+        # The wait's reason says more than the classifier's (what it waited for, how long).
+        if not aio_ok and v.classification in (Classification.ok, Classification.aio_incomplete):
             res.classification, res.reason, res.aio_state = Classification.aio_incomplete, aio_reason, AioState.incomplete
         if res.classification is Classification.ok:
             await self._resolve_links(slot, res, t0)
@@ -399,15 +423,20 @@ class Fetcher:
         problem: dict[str, str] = {}  # why the last click on a control didn't count
         last_len, stable_since = -1, time.perf_counter()
         pending: list[dict] = []
+        shell = False
         while time.perf_counter() < end:
             probe = await page.evaluate(AIO_PROBE_JS)
             if not probe["present"]:
                 return False, "AI Overview disappeared while loading"
             now = time.perf_counter()
-            # Only a shell waits on the network: a block that already has its text
-            # settles on stability, as /async/folsrch also runs on pages whose
-            # AIO is complete (and on pages without one).
-            loading = net is not None and probe["len"] < AIO_SHELL_CHARS and (bool(net.async_pending) or not net.async_done)
+            # A shell with no answer text is never settled: it is still loading, whatever
+            # the network says (smoke-de q04/q45 were declared complete after ~550 ms on
+            # the placeholder, then reported as "0 chars"). A short block that has some
+            # answer waits on the network; one with its text settles on stability, as
+            # /async/folsrch also runs on pages whose AIO is complete (and without one).
+            shell = probe["len"] < AIO_SHELL_CHARS and not probe.get("answer", True)
+            loading = shell or (net is not None and probe["len"] < AIO_SHELL_CHARS
+                                and (bool(net.async_pending) or not net.async_done))
             if probe["len"] != last_len or probe["busy"] or loading:
                 last_len, stable_since = probe["len"], now
             elif now - stable_since >= STABLE_S:
@@ -420,6 +449,7 @@ class Fetcher:
                 if attempts.get(bid, 0) >= MAX_EXPAND_ATTEMPTS:
                     return False, f"could not expand '{label}' after {MAX_EXPAND_ATTEMPTS} attempts ({problem.get(bid, 'no visible change')})"
                 attempts[bid] = attempts.get(bid, 0) + 1
+                await self._wait_scripts_quiet(page, net, end)
                 before_url = page.url
                 remaining_ms = int((end - time.perf_counter()) * 1000)
                 clicked = False
@@ -432,7 +462,7 @@ class Fetcher:
                 if page.url != before_url:  # also when the click raised part-way
                     return False, f"clicking '{label}' navigated away"
                 if clicked:
-                    if await self._expansion_verified(page, {**button, "len_before": probe["len"]}, end):
+                    if await self._expansion_verified(page, {**button, "len_before": probe["len"]}, end, net):
                         done.add(bid)
                         problem.pop(bid, None)
                     else:
@@ -440,17 +470,29 @@ class Fetcher:
                         log.warning("clicking '%s' (attempt %d) made no visible change", label, attempts[bid])
                 last_len, stable_since = -1, time.perf_counter()
             await page.wait_for_timeout(100)
+        if shell:
+            return False, (f"AI Overview still loading after {self.s.aio_max_wait_ms} ms: "
+                           "only the 'AI Mode reply' placeholder, no answer text")
         left = ", ".join(f"'{b['label']}' ({problem.get(b['id'], 'not clicked yet')})" for b in pending)
         return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms" + (f"; not expanded: {left}" if left else "")
 
-    async def _expansion_verified(self, page: Page, button: dict, end: float) -> bool:
-        """Poll until the page shows that clicking `button` expanded something,
-        for up to EXPAND_VERIFY_MS (never past `end`)."""
+    async def _wait_scripts_quiet(self, page: Page, net: NetworkWatch | None, end: float) -> None:
+        """Before a click: let lazily loaded scripts arrive, up to SCRIPT_QUIET_MAX_MS (never past `end`)."""
+        if net is None:
+            return
+        until = min(end, time.perf_counter() + SCRIPT_QUIET_MAX_MS / 1000)
+        while not net.scripts_quiet(SCRIPT_IDLE_S) and time.perf_counter() < until:
+            await page.wait_for_timeout(100)
+
+    async def _expansion_verified(self, page: Page, button: dict, end: float, net: NetworkWatch | None = None) -> bool:
+        """Poll until the page shows that clicking `button` expanded something, for up
+        to EXPAND_VERIFY_MS, longer while scripts are still loading (never past `end`)."""
         until = min(end, time.perf_counter() + EXPAND_VERIFY_MS / 1000)
         while True:
             if _expansion_seen(button, await page.evaluate(AIO_PROBE_JS)):
                 return True
-            if time.perf_counter() >= until:
+            now = time.perf_counter()
+            if now >= end or (now >= until and (net is None or net.scripts_quiet(SCRIPT_IDLE_S))):
                 return False
             await page.wait_for_timeout(100)
 

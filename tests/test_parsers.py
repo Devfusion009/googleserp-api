@@ -232,3 +232,47 @@ def test_suggestions_from_bottom_of_page_not_knowledge_panel_carousel():
     assert suggestions, "t_mobile should have a 'People also search for' block at the bottom"
     assert all("T-Mobile" in s or "t-mobile" in s.lower() for s in suggestions)
     assert "Deutsche Telekom" not in suggestions  # that's the knowledge panel's related-entity carousel, not a search suggestion
+
+
+# --- AI Overview bullets with sub-lists ------------------------------------------
+# Each sub-bullet used to be written twice: inside its parent bullet's text and again
+# as its own bullet. car_insurance_quotes_de is the Germany smoke-test sample (q40).
+
+def _aio_text(tree: HTMLParser) -> str:
+    return "\n".join(s.text for s in parse_aio(find_aio_root(tree)).sections)
+
+
+@pytest.mark.parametrize("path, parent, children", [
+    ("aio_nested/car_insurance_quotes_de.html", "GEICO",
+     ["Average cost: Competitive state minimums and full coverage options.",
+      "Best for: Fast online tools and everyday discounts.", "Get a GEICO Quote"]),
+    ("best_supplements_for_sleep.html", "Melatonin",
+     ["Best for: Falling asleep faster, jet lag, or shifting a delayed sleep schedule."]),
+    ("t_mobile.html", "Experience Beyond 2.0:", ["1 Line: $105 per month", "2 Lines: $180 per month"]),
+])
+def test_aio_sub_bullets_are_written_once_under_their_parent(path, parent, children):
+    text = _aio_text(HTMLParser((FIXTURES / path).read_text(encoding="utf-8")))
+    lines = text.splitlines()
+    parent_line = next(i for i, ln in enumerate(lines) if ln.startswith(f"- {parent}"))
+    for child in children:
+        assert text.count(child) == 1, f"{child!r} written {text.count(child)} times"
+        assert lines.index(f"  - {child}") > parent_line
+    assert not any(c in lines[parent_line] for c in children)  # the parent line is its own text only
+
+
+def test_aio_bullets_keep_their_nesting_and_all_their_content():
+    text = _aio_text(HTMLParser((FIXTURES / "aio_nested/car_insurance_quotes_de.html").read_text(encoding="utf-8")))
+    section = text.split("\n- Gather details")[0]
+    assert section.splitlines() == [
+        "- GEICO",
+        "  - Average cost: Competitive state minimums and full coverage options.",
+        "  - Best for: Fast online tools and everyday discounts.",
+        "  - Get a GEICO Quote",
+        "- Progressive",
+        "  - Average cost: Personalized rates via Progressive Auto Insurance .",
+        "  - Best for: Comparing side-by-side rates with Snapshot.",
+        "- State Farm",
+        "  - Average cost: Saves switchers an average of $740.",
+        "  - Best for: Bundling home and auto policies.",
+        "  - Get a State Farm Quote",
+    ]

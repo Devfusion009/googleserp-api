@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # Skip the exit-IP check before a request when this slot's IP was checked this
     # recently (the previous request's check after it). 0 = check before every request.
     exit_ip_recheck_seconds: float = 60
+    # The browser's timezone (Date, Intl). Unset, the page reports the host's timezone
+    # whatever the exit IP - the mobile run's US IPs carried Asia/Kolkata. With
+    # TIMEZONE_FROM_EXIT_IP the timezone comes from the exit-IP check's answer, so
+    # EXIT_IP_CHECK_URL must return JSON with a "timezone" (e.g. https://ipinfo.io/json);
+    # TIMEZONE_ID (an IANA name, e.g. America/Chicago) is used when the check gives none.
+    timezone_from_exit_ip: bool = True
+    timezone_id: str = ""
     # Build each slot's context (and run its first exit-IP check) at startup, so
     # the first request doesn't pay for it.
     prewarm_slots: bool = True

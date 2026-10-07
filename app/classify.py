@@ -119,6 +119,15 @@ def _in_related_question(node: Node) -> bool:
     return False
 
 
+def _prose_len(node: Node) -> int:
+    """Length of `node`'s text without script/style/noscript content."""
+    clone = HTMLParser(node.html or "")
+    for n in clone.css(", ".join(NON_TEXT_TAGS)):
+        n.decompose()
+    root = clone.body or clone.root
+    return len(root.text(strip=True)) if root else 0
+
+
 def find_aio_root(tree: HTMLParser) -> Node | None:
     """The AI Overview block of the searched query: the nearest large container around a
     heading whose text is exactly 'AI Overview', skipping any inside a People Also Ask
@@ -126,12 +135,13 @@ def find_aio_root(tree: HTMLParser) -> Node | None:
     for h in tree.css("h1, h2, div[role=heading], span[role=heading]"):
         if (h.text(strip=True) or "").lower() == "ai overview" and not _in_related_question(h):
             node = h
-            # climb until the container holds more than the heading itself
+            # climb until the container holds more than the heading itself (script and
+            # style text doesn't count: a wrapper of inline scripts is not the answer)
             for _ in range(8):
                 if node.parent is None:
                     break
                 node = node.parent
-                if len(node.text(strip=True)) > 200:
+                if _prose_len(node) > 200:
                     return node
             return node
     return None
@@ -156,7 +166,10 @@ def aio_state(tree: HTMLParser) -> tuple[AioState, str]:
         if _has_answer(root):
             return AioState.complete, "AI Overview text present"
         if AIO_STUB_TEXT in body:
-            return AioState.incomplete, "AI Overview not served: only the 'AI Mode reply' placeholder, no answer text"
+            # The shell Google sends before the answer streams in; seen on pages whose
+            # screenshot still showed the "Searching" skeleton, so not proof Google
+            # served no answer.
+            return AioState.incomplete, "AI Overview still loading: only the 'AI Mode reply' placeholder, no answer text"
         return AioState.incomplete, f"AI Overview has only {len(body)} chars of text"
     return AioState.complete, "AI Overview text present"
 

@@ -356,3 +356,70 @@ the click succeeded, so a failing "Show more"/"Show all" still returned
   request (server saw 2 hits either way). Documented; no response bytes.
 
 Tests: 183 (7 need a local Chromium; `playwright install chromium`).
+
+## Phase 10 - Germany smoke-test feedback (offline) - DONE
+
+Client feedback (2026-10-05): re-run with the expansion fixes; GEICO / Progressive /
+State Farm sub-bullets appear inside their parent bullet and again on their own.
+
+### 1. Placeholder AI Overview declared finished (smoke-de q04, q45)
+- Reported earlier as "Google served only the 'AI Mode reply' placeholder". Wrong:
+  `POCAIO wait_end ms=549` / `ms=557` - the wait ended ~0.55 s into 8 s. The q45
+  screenshot (taken ~2 s after the HTML) shows the full answer; q04's still shows
+  the "Searching" skeleton.
+- Cause: typed search loads the homepage first, whose `/async/hpba` requests set
+  `NetworkWatch.async_done`; it was never reset for the results page, so the
+  shell looked loaded and settled after 0.3 s of stable length.
+- Now: async tracking resets on every main-frame Document request (frame id from
+  `Page.getFrameTree`); a shell with no answer markup (`.n6owBd`, aria-level 3
+  heading, `li`) and < 200 chars is never settled - at the deadline it is
+  `aio_incomplete: AI Overview still loading after N ms`. The wait's reason now
+  replaces the classifier's when both say incomplete.
+
+### 2. Nested AI Overview bullets written twice
+- `parse_aio` read a parent `<li>` with its sub-list's text, then each sub-`<li>`
+  again. Now a bullet's own text excludes nested lists and sub-bullets are
+  indented two spaces per level. Same bug was in the `best_supplements_for_sleep`
+  and `t_mobile` fixtures. Germany sample saved as
+  `tests/fixtures/aio_nested/car_insurance_quotes_de.html`.
+
+Seen, not fixed: `t_mobile` bullets carry "Go to product viewer dialog for this
+item."; `best_supplements_for_sleep` "Safety Tips" ends with a GoodRx source card
+read as a bullet.
+
+Tests: 216 (all browser tests ran locally).
+
+## Phase 11 - Mobile smoke test + lazily loaded expand controls - DONE
+
+Mobile run (2026-10-05, Infatica mobile US, 60 requests incl. 3 pilot, 73.8 MB est.):
+page access 3/60 (5%), fully valid 2/60, CAPTCHA 57/60. Report:
+`poc/client_report_mobile/` (generator `tools/mkmobile.py`, runner
+`poc/proxy_quality/run_smoke_budget.sh` with request cap + traffic budget).
+
+### Expansion fixes checked live
+- Both valid pages were "how does dns work" (a Germany click-order failure): the
+  overview's own "Show more" was clicked first, then "Show all" - fixed order held.
+- New: "Show all" made no change on its first 1-2 clicks. The network log shows
+  why: after "Show more" Google lazy-loads xjs and gstatic search-next scripts
+  (~4 s on the mobile link); clicks before they arrive do nothing. It worked on a
+  retry but used 2 of the 3 attempts.
+- Now: NetworkWatch tracks in-flight scripts; before an expand click the wait
+  lets them go quiet (none in flight for 0.5 s, max 2.5 s), and a click's effect
+  is awaited past 1.5 s while scripts still load (no re-click that a queued
+  jsaction event could replay as a second toggle). Browser test with a 4.5 s late
+  script: old code fails "could not expand 'Show all' after 3 attempts".
+
+### Browser timezone matched to the exit IP
+- Every mobile-run page reported Asia/Kolkata (the host's timezone; Chromium says
+  "Asia/Calcutta") behind a US exit IP - a mismatch Google can read from JS.
+- Now (`TIMEZONE_FROM_EXIT_IP=true`, default): the exit-IP check's JSON names the
+  timezone (`EXIT_IP_CHECK_URL=https://ipinfo.io/json`; ip-api and ipwho.is
+  shapes parsed too). A context's timezone is fixed at creation, so a new context
+  is checked first and, if a timezone came back, closed unused and built again on
+  the same proxy URL (same sticky session) with `timezone_id`. `TIMEZONE_ID` is
+  the fallback; unknown names are ignored (checked with zoneinfo). The timezone is
+  in `X-Proxy-Session`. Verified through a mobile line: ipinfo answers
+  America/New_York for a Georgia T-Mobile IP. Not yet measured against Google.
+
+Success screenshots were off in the mobile run (runner now defaults
+DEBUG_SCREENSHOT_ON_SUCCESS=true). Tests: 227.
