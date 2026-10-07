@@ -19,10 +19,29 @@ class Settings(BaseSettings):
     blocked_resource_types: str = "image,media,font"
     viewport_width: int = 1366
     viewport_height: int = 768
+    # The screen the page reports. Unset, Playwright reports the viewport as the screen, and
+    # the window (viewport + browser frame) comes out taller than the screen - impossible
+    # on a real device. A common laptop/desktop screen, larger than the viewport.
+    screen_width: int = 1920
+    screen_height: int = 1080
+    # en-US contexts take their language from Chrome itself (--lang=en-US) instead of
+    # Playwright's locale emulation plus a hand-written Accept-Language header; the values
+    # are then exactly what a real Chrome set to en-US produces. Other locales still use
+    # emulation.
+    native_en_us_languages: bool = True
+    # The language Chrome itself is set to (--lang); contexts in this locale take their
+    # languages from Chrome, others are emulated. en-US by default.
+    native_locale: str = "en-US"
+    # The browser's locale for every request, whatever the request's gl/hl (which still go
+    # to Google unchanged): e.g. pl-PL behind Polish exit IPs. Empty = from gl/hl.
+    browser_locale: str = ""
     results_per_page: int = 10
     nav_timeout_ms: int = 15000
     aio_appear_wait_ms: int = 1500
-    aio_max_wait_ms: int = 8000
+    # 12 s, not 8: on Polish exits (2026-10-07) Google loaded the sources' 'Show all' code
+    # ~5 s after 'Show more', and an 8 s budget ended before the click could be confirmed
+    # or retried (7 pages). Pages that expand quickly still finish in ~4-7 s.
+    aio_max_wait_ms: int = 12000
     aio_click_timeout_ms: int = 4000  # per 'Show more/all' click attempt (still bounded by aio_max_wait_ms)
     request_deadline_ms: int = 25000
     max_retries: int = 0
@@ -64,6 +83,10 @@ class Settings(BaseSettings):
     search_mode: Literal["url", "typed"] = "url"
     typed_key_delay_min_ms: int = 30
     typed_key_delay_max_ms: int = 90
+    # Typed search: pause on the homepage (random, within this range) before clicking the
+    # search box, like a visitor who looks at the page first. 0 = no pause.
+    typed_warmup_min_ms: int = 0
+    typed_warmup_max_ms: int = 0
     # web-agent-master/google-search techniques (POC, opt-in): "fingerprint" patches navigator/
     # window/WebGL/screen values with init scripts; "state_file" reuses cookies saved after a
     # successful search (storage state) and saves them again after each success.

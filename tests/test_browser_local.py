@@ -85,6 +85,11 @@ EXPAND_VARIANTS = {
   e.currentTarget.style.display = 'none';
   const s = document.createElement('script'); s.src = '/lazy.js'; document.body.appendChild(s);
 });</script>""",
+    "lazy_slow": _MORE + """<div id="all" role="button" style="display:inline-block;padding:4px">Show all</div>
+<script>document.getElementById('more').addEventListener('click', e => {
+  e.currentTarget.style.display = 'none';
+  const s = document.createElement('script'); s.src = '/lazy_slow.js'; document.body.appendChild(s);
+});</script>""",
 }
 LAZY_JS = b"document.getElementById('all').addEventListener('click', e => { e.currentTarget.style.display = 'none'; window.__allClicks = (window.__allClicks || 0) + 1; });"
 
@@ -117,6 +122,8 @@ document.querySelector('textarea').addEventListener('keydown', e => { if (e.key 
 # Like Google's consent dialog on UK/EU exits: covers the page until "Reject all" is pressed
 CONSENT_OVERLAY = """<div id="consent" style="position:fixed;inset:0;background:#fff;z-index:9"><h1>Before you continue to Google</h1>
 <button>Accept all</button><button onclick="document.getElementById('consent').remove()">Reject all</button></div>"""
+CONSENT_OVERLAY_PL = """<div id="consent" style="position:fixed;inset:0;background:#fff;z-index:9"><h1>Zanim przejdziesz do Google</h1>
+<button>Zaakceptuj wszystko</button><button onclick="document.getElementById('consent').remove()">Odrzuć wszystko</button></div>"""
 
 
 def _shell_page(fill_after_ms: int | None) -> str:
@@ -180,13 +187,20 @@ class FakeGoogle(BaseHTTPRequestHandler):
                 return self._send(200, b"no redirect for you", [("Content-Type", "text/plain")])
             dest = "/sorry/index?continue=x" if token in self.sorry_tokens else f"https://dest.example/{token.lower()}"
             return self._send(302, headers=[("Location", dest)])
+        if parts.path == "/search" and (parse_qs(parts.query).get("q") or [""])[0] == "blockme":
+            # like Google blocking at the first search: 302 to /sorry/ with the search URL encoded
+            return self._send(302, headers=[("Location", "/sorry/index?continue=https://www.google.com/search%3Fq%3Dblockme")])
+        if parts.path == "/sorry/index":
+            body = b"<html><body>Our systems have detected unusual traffic from your computer network.</body></html>"
+            return self._send(429, body, [("Content-Type", "text/html")])
         if parts.path == "/search":
             type(self).search_queries.append((parse_qs(parts.query).get("q") or [None])[0])
             variant = (parse_qs(parts.query).get("v") or [None])[0]
             return self._send(200, page_for(variant).encode(), [("Content-Type", "text/html; charset=utf-8")])
         if parts.path == "/":
             type(self).home_hits += 1
-            home = HOME.replace("</body>", CONSENT_OVERLAY + "</body>") if self.consent_on_home else HOME
+            overlay = CONSENT_OVERLAY_PL if self.consent_on_home == "pl" else CONSENT_OVERLAY
+            home = HOME.replace("</body>", overlay + "</body>") if self.consent_on_home else HOME
             return self._send(200, home.encode(), [("Content-Type", "text/html; charset=utf-8")])
         if parts.path == "/ipjson":  # like https://ipinfo.io/json
             body = b'{"ip": "203.0.113.7", "city": "Chicago", "timezone": "America/Chicago"}'
@@ -194,8 +208,9 @@ class FakeGoogle(BaseHTTPRequestHandler):
         if parts.path == "/ip":
             type(self).ip_hits += 1
             return self._send(200, b"203.0.113.7", [("Content-Type", "text/plain")])
-        if parts.path == "/lazy.js":
-            time.sleep(4.5)  # longer than three 1.5 s click checks
+        if parts.path in ("/lazy.js", "/lazy_slow.js"):
+            # 4.5 s: longer than three 1.5 s click checks; 7.5 s: the slowest Polish-exit pages
+            time.sleep(7.5 if parts.path == "/lazy_slow.js" else 4.5)
             return self._send(200, LAZY_JS, [("Content-Type", "text/javascript")])
         if parts.path == "/image.png":
             type(self).image_hits += 1
@@ -340,6 +355,15 @@ async def test_a_control_whose_code_loads_late_is_clicked_once_it_has_loaded(fak
     assert out.ok, f"{out.error_code}: {out.error_message}"
 
 
+async def test_a_control_whose_code_takes_7_s_to_load_is_expanded_within_the_default_budget(fake_google, browsers):
+    # Poland run 2026-10-07: 'Show all' code arrived ~5 s after 'Show more'; the old 8 s budget
+    # (and 2.5 s pre-click wait) ran out after one unconfirmed click.
+    settings, manager = browsers
+    settings.aio_max_wait_ms = Settings(_env_file=None).aio_max_wait_ms
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=lazy_slow"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
 async def test_fallback_goto_traffic_is_counted_and_marked_partial(fake_google, browsers):
     # Two links can't be resolved in the page, so they go through the request
     # client outside the browser - whose traffic CDP never sees.
@@ -444,6 +468,40 @@ async def test_typed_search_opens_the_homepage_types_the_query_and_returns_the_s
         assert FakeGoogle.search_queries == ["dns"]  # and the query reached /search by typing + Enter
         assert [o.url for o in out.pages[0].organic] == ["https://dest.example/token_r1", "https://dest.example/token_r2"]
         assert out.pages[0].ai_overview.sections[0].title == "How it works"
+    finally:
+        await manager.stop()
+
+
+async def test_typed_search_rejects_the_polish_consent_dialog(fake_google):
+    FakeGoogle.consent_on_home = "pl"
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2, debug_artifacts=False)
+    try:
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&gl=us&hl=en"), Fetcher(settings, manager), settings)
+        assert out.ok, f"{out.error_code}: {out.error_message}"
+        assert FakeGoogle.search_queries == ["dns"]
+    finally:
+        await manager.stop()
+
+
+async def test_typed_search_pauses_on_the_homepage_before_typing(fake_google):
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2,
+                                       typed_warmup_min_ms=1200, typed_warmup_max_ms=1200, debug_artifacts=False)
+    try:
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&gl=us&hl=en"), Fetcher(settings, manager), settings)
+        assert out.ok, f"{out.error_code}: {out.error_message}"
+        assert out.first.timings["nav_ms"] >= 1200
+    finally:
+        await manager.stop()
+
+
+async def test_typed_search_blocked_at_the_first_search_is_a_captcha_not_a_timeout(fake_google):
+    # Live (session run 2026-10-07): the redirect to /sorry/ never matched the "/search?" wait,
+    # so the block came back after the 15 s navigation timeout, classified as a timeout.
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2, debug_artifacts=False)
+    try:
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=blockme&gl=us&hl=en"), Fetcher(settings, manager), settings)
+        assert out.error_code == "blocked_captcha", f"{out.error_code}: {out.error_message}"
+        assert out.first.timings["nav_ms"] < 5000
     finally:
         await manager.stop()
 

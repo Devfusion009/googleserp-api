@@ -28,6 +28,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -66,6 +67,24 @@ if (window === window.top) {
 """
 
 log = logging.getLogger("serp.browser")
+
+# Chrome's own language setting (Settings.native_locale): for contexts in that locale the
+# Accept-Language header ("en-US,en;q=0.9") and navigator.languages (["en-US"]) are produced
+# by Chrome itself, as in a real Chrome set to that language, not by emulation and a
+# hand-written header. Chrome reads --lang only on Windows; on Linux it takes the language
+# from the locale environment (LANGUAGE / LANG), so both are set.
+def native_args(s: Settings) -> list[str]:
+    """Chrome's own language setting (Settings.native_locale), when native languages are on."""
+    return [f"--lang={s.native_locale}"] if s.native_en_us_languages and s.native_locale else []
+
+
+def native_env(s: Settings) -> dict[str, str] | None:
+    """Locale environment for the browser process (Linux reads the language from it)."""
+    if not (s.native_en_us_languages and s.native_locale):
+        return None
+    lang, _, region = s.native_locale.partition("-")
+    full = f"{lang}_{region}" if region else lang
+    return {**os.environ, "LANGUAGE": f"{full}:{lang}", "LANG": f"{full}.UTF-8", "LC_ALL": f"{full}.UTF-8"}
 
 
 class PageSlot(Protocol):
@@ -172,6 +191,9 @@ class BrowserManager:
             kwargs["executable_path"] = self.s.browser_executable_path
         if self.s.repo_fingerprint:
             kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+        kwargs["args"] = kwargs.get("args", []) + native_args(self.s)
+        if native_env(self.s):
+            kwargs["env"] = native_env(self.s)
         if self.s.proxy_mode != "none" and self.s.launch_proxy:
             kwargs["proxy"] = {"server": self.s.launch_proxy}  # see Settings.launch_proxy
         self.browser = await self._pw.chromium.launch(**kwargs)
@@ -251,10 +273,9 @@ class BrowserManager:
         slot.session = secrets.token_hex(4) if template and "{session}" in template else None
         proxy = template.replace("{session}", slot.session) if template and slot.session else template
         viewport = {"width": self.s.viewport_width, "height": self.s.viewport_height}
-        opts = dict(
-            viewport=viewport, locale=locale,
-            extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"},
-        )
+        opts = dict(viewport=viewport, screen={"width": self.s.screen_width, "height": self.s.screen_height})
+        if not (self.s.native_en_us_languages and locale == self.s.native_locale):
+            opts.update(locale=locale, extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"})
         if proxy:
             opts["proxy"] = to_playwright(proxy)
         state = self.s.repo_state_file
@@ -303,7 +324,7 @@ class BrowserManager:
 
     async def _prepare(self, slot: Slot, country: str | None, language: str | None) -> None:
         slot.report = {}  # this request's session facts; exit-IP checks count into it
-        locale = locale_for(country, language)
+        locale = self.s.browser_locale or locale_for(country, language)
         template = self.provider.next(country) if (self.provider.rotates or slot.context is None) else slot.proxy_template
         reason = self._rebuild_reason(slot, template, locale)
         if reason:
