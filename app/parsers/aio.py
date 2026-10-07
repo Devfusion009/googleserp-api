@@ -11,18 +11,25 @@ works" for the human-readable version of these rules):
     with a sub-list (e.g. "GEICO" over "Average cost: ..." / "Best for: ...") is read
     without its sub-list, and each sub-bullet is indented two spaces per level, so
     the sub-bullets are written once and stay under their parent.
-  - The sources panel: a <li class="h7wxwc"> per source card, each holding one
+  - The sources panel: an <li> per source card (class "h7wxwc", renamed "Ioqnib" in pages
+    from 2026-10-07; other <li>s around the same links, e.g. "Gzwrb" / "Ndm2cf", are
+    hidden citation pop-ups, not the panel), each holding one
     <a class="vIWmYe"> (title in aria-label; href is either the real destination
     or Google's /goto?url=<token> wrapper, resolved through ParseContext.links -
     see app/links.py) plus ".gpZmoc" (title text again) and ".hxIQcc" (snippet).
     A card whose destination can't be resolved is a gap (the page fails as
-    aio_incomplete), and so is an AI Overview with no source cards at all or no
-    readable text. This panel always comes after the response's own text in
+    aio_incomplete), and so is an AI Overview with no readable text, or with links shaped
+    like source cards in a layout we don't know. An overview that shows no source panel
+    at all (some do) is complete with sources: [] and a warning. This panel always comes after the response's own text in
     document order, so it also marks where we stop reading intro/section text -
     the one paragraph Google adds after the last heading ("If you'd like to know
     more, ask about X or Y") is real response text and stays attached to the last
     section; everything from the sources panel onward (including its several
     hidden accessibility copies of the same cards) is dropped from intro/sections.
+  - The newer sources panel (seen from 2026-10-07): a div[role=list] of div[role=listitem]
+    cards, each with one <a class="POYEld"> (aria-label "<title>. Opens in new tab."; href
+    as above), the title in ".vFyWT" and the snippet in ".BEwxRe". Same rules as the old
+    cards; either layout counts as the panel.
 Google renders a hidden aria-only duplicate right next to almost everything here;
 dedupe_consecutive() drops the repeat.
 """
@@ -37,7 +44,7 @@ from .misc import clean_prose, clean_text, dedupe_consecutive, node_text
 
 log = logging.getLogger("serp.parsers.aio")
 
-SOURCE_ITEM_CLASS = "h7wxwc"
+SOURCE_ITEM_SELECTOR = "li.h7wxwc, li.Ioqnib"
 SOURCE_LINK_CLASS = "vIWmYe"
 SOURCE_TITLE_CLASS = "gpZmoc"
 SOURCE_SNIPPET_CLASS = "hxIQcc"
@@ -46,6 +53,14 @@ PARAGRAPH_CLASS = "n6owBd"
 # favicon + "Cloudflare +1"). It carries no prose of its own, so it's stripped
 # before reading paragraph/bullet text - otherwise it reads as junk trailing text.
 CITATION_BADGE_CLASS = "WBgIic"
+# The newer sources panel (see module docstring).
+CARD2_LINK_CLASS = "POYEld"
+CARD2_TITLE_CLASS = "vFyWT"
+CARD2_SNIPPET_CLASS = "BEwxRe"
+OPENS_IN_NEW_TAB = ". Opens in new tab."
+# Every source card link so far (both layouts) carries this aria-label; inline citation
+# chips and the overview's own links do not.
+CARD_LINK_HINT = 'a[aria-label$="Opens in new tab."]'
 
 
 @dataclass
@@ -106,29 +121,53 @@ def _is_product_card(link: Node | None, href: str | None) -> bool:
     return link is not None and not href and link.attributes.get("role") == "button" and bool(link.attributes.get("data-cid"))
 
 
+def _card_title(item: Node, link: Node | None, newer: bool) -> str | None:
+    if not newer:
+        return node_text(item.css_first(f".{SOURCE_TITLE_CLASS}"))
+    title = node_text(item.css_first(f".{CARD2_TITLE_CLASS}"))
+    if not title and link is not None:
+        title = clean_text((link.attributes.get("aria-label") or "").removesuffix(OPENS_IN_NEW_TAB)) or None
+    return title
+
+
+def _source_cards(root: Node) -> list[tuple[Node, Node | None, bool]]:
+    """(card, its link, newer layout?) for every source card, old and newer layout, in page order."""
+    cards = [(item, item.css_first(f"a.{SOURCE_LINK_CLASS}"), False) for item in root.css(SOURCE_ITEM_SELECTOR)]
+    for item in root.css("[role=listitem]"):
+        link = item.css_first(f"a.{CARD2_LINK_CLASS}")
+        if link is not None:
+            cards.append((item, link, True))
+    return cards
+
+
+def _is_sources_panel(node: Node) -> bool:
+    if node.tag in ("ul", "ol") and node.css_first(SOURCE_ITEM_SELECTOR):
+        return True
+    return node.attributes.get("role") == "list" and node.css_first(f"a.{CARD2_LINK_CLASS}") is not None
+
+
 def _parse_sources(root: Node, ctx: ParseContext, warnings: list[str]) -> list[AioSource]:
     sources: list[AioSource] = []
     seen: set[str] = set()
-    for item in root.css(f"li.{SOURCE_ITEM_CLASS}"):
-        link = item.css_first(f"a.{SOURCE_LINK_CLASS}")
+    for item, link, newer in _source_cards(root):
         href = link.attributes.get("href") if link else None
         if _is_product_card(link, href):
             # A shopping card: a button that opens Google's product viewer in the
             # page. It is UI, not a citation - there is no page it cites.
-            warnings.append(f"aio product card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r} is a shopping element, not a citation; not listed")
+            warnings.append(f"aio product card {_card_title(item, link, newer) or '?'!r} is a shopping element, not a citation; not listed")
             continue
         # Redirect wrappers (/goto, /url?q=) are resolved; a citation of a Google
         # page (e.g. Google Flights) is a genuine source and stays. A citation
         # that can't be resolved is a gap, never silently dropped.
         url = strip_text_fragment(ctx.links.resolve(href))
         if not url:
-            ctx.gap("ai_overview", f"source card {node_text(item.css_first(f'.{SOURCE_TITLE_CLASS}')) or '?'!r}: {ctx.link_problem(href)}")
+            ctx.gap("ai_overview", f"source card {_card_title(item, link, newer) or '?'!r}: {ctx.link_problem(href)}")
             continue
         if url in seen:
             continue
         seen.add(url)
-        title = node_text(item.css_first(f".{SOURCE_TITLE_CLASS}"))
-        snippet = node_text(item.css_first(f".{SOURCE_SNIPPET_CLASS}"))
+        title = _card_title(item, link, newer)
+        snippet = node_text(item.css_first(f".{CARD2_SNIPPET_CLASS if newer else SOURCE_SNIPPET_CLASS}"))
         sources.append(AioSource(title=title, url=url, snippet=snippet))
     return sources
 
@@ -137,7 +176,7 @@ def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
     """root is the AI Overview container, as returned by classify.find_aio_root."""
     ctx = ctx if ctx is not None else ParseContext()
     warnings: list[str] = []
-    has_cards = root.css_first(f"li.{SOURCE_ITEM_CLASS}") is not None
+    has_cards = bool(_source_cards(root))
     sources = _parse_sources(root, ctx, warnings)
 
     for badge in root.css(f".{CITATION_BADGE_CLASS}"):
@@ -161,7 +200,7 @@ def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
     for node in root.traverse():
         if node.tag == "-text":
             continue
-        if node.tag in ("ul", "ol") and node.css_first(f"li.{SOURCE_ITEM_CLASS}"):
+        if _is_sources_panel(node):
             # reached the sources panel - nothing after this point is response text.
             break
         if node.attributes.get("role") == "heading":
@@ -193,7 +232,14 @@ def parse_aio(root: Node, ctx: ParseContext | None = None) -> ParsedAio:
         # as a page without one.
         ctx.gap("ai_overview", "AI Overview text could not be read")
     elif not has_cards:
-        ctx.gap("ai_overview", "no source cards found")
+        if root.css_first(CARD_LINK_HINT):
+            # Links shaped like source cards are there, but in no layout we know: a gap,
+            # so a new layout never passes off as an overview without sources.
+            ctx.gap("ai_overview", "source cards present but not recognised (unknown layout)")
+        else:
+            # Some overviews carry no source panel at all (e.g. 'chase bank login', only an
+            # inline link) - nothing on the page is being dropped.
+            warnings.append("AI Overview shows no source cards")
 
     for w in warnings:
         log.warning(w)

@@ -104,7 +104,7 @@ EXPAND_VERIFY_MS = 1500
 # past EXPAND_VERIFY_MS for as long as scripts are still loading - re-clicking then could
 # be queued and replayed as a second toggle.
 SCRIPT_IDLE_S = 0.5
-SCRIPT_QUIET_MAX_MS = 2500
+SCRIPT_QUIET_MAX_MS = 4500  # 2.5 s clicked 'Show all' while its code was still arriving (Polish exits)
 # Playwright waits this long for the button to be visible, stable and unobscured
 # before a click fails. 1 s was too short on a slow live page (UK run r09: three
 # 'Locator.click: Timeout 1000ms exceeded' on a page that had fully loaded), so it
@@ -292,7 +292,9 @@ class Fetcher:
         consent cookie (typical on UK/EU exits) and blocks the search box. Press its "Reject all"
         button, in the page or in a consent iframe, as a visitor would; this sets the consent
         cookie for the context. No-op when the dialog is absent."""
-        name = re.compile(r"^\s*reject all\s*$", re.I)
+        # The dialog follows the browser's language: English, or Polish behind Polish exits
+        # with a pl-PL browser (BROWSER_LOCALE), German for de-DE.
+        name = re.compile(r"^\s*(reject all|odrzuć wszystko|alle ablehnen)\s*$", re.I)
         for frame in page.frames:
             btn = frame.get_by_role("button", name=name).first
             try:
@@ -322,6 +324,9 @@ class Fetcher:
         if "/sorry/" in page.url or urlsplit(page.url).hostname == "consent.google.com":
             return
         await self._reject_consent(page)
+        lo_w, hi_w = sorted((self.s.typed_warmup_min_ms, self.s.typed_warmup_max_ms))
+        if hi_w > 0:
+            await page.wait_for_timeout(random.randint(lo_w, hi_w))
         box = page.locator("textarea[name='q'], input[name='q']").first
         try:
             await box.click(timeout=min(timeout, 5000))
@@ -332,7 +337,10 @@ class Fetcher:
         await page.keyboard.type(qs["q"][0], delay=random.randint(lo, hi))
         await page.wait_for_timeout(random.randint(100, 300))
         await page.keyboard.press("Enter")
-        await page.wait_for_url(re.compile(r"/search\?"), wait_until="domcontentloaded", timeout=timeout)
+        # Results, or Google's CAPTCHA page: a block at the first search redirects to
+        # /sorry/index?continue=...search%3F... (encoded), which "/search?" alone never
+        # matched - the wait ran to its timeout and the block was reported as a timeout.
+        await page.wait_for_url(re.compile(r"/search\?|/sorry/"), wait_until="domcontentloaded", timeout=timeout)
 
     async def _run(self, slot: PageSlot, url: str, res: FetchResult, t0: float) -> None:
         page = slot.page

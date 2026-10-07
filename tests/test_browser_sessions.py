@@ -231,3 +231,39 @@ async def test_with_a_proxy_the_browser_wide_proxy_is_a_dead_end(monkeypatch):
 async def test_without_a_proxy_or_with_it_turned_off_there_is_no_browser_wide_proxy(monkeypatch):
     assert "proxy" not in await _launch_kwargs(monkeypatch)
     assert "proxy" not in await _launch_kwargs(monkeypatch, proxy_mode="static", proxy_url=PROXY, launch_proxy="")
+
+
+# --- what the page reports: screen and languages ----------------------------------
+
+async def test_the_screen_is_larger_than_the_viewport():
+    m = manager()
+    await use(m)
+    opts = m.browser.contexts[0].opts
+    assert opts["screen"] == {"width": 1920, "height": 1080}
+    assert opts["viewport"]["width"] < 1920 and opts["viewport"]["height"] < 1080
+
+
+async def test_en_us_languages_come_from_chrome_and_other_locales_are_emulated():
+    m = manager()
+    async with m.page("US", "en"):
+        pass
+    assert "locale" not in m.browser.contexts[0].opts and "extra_http_headers" not in m.browser.contexts[0].opts
+    async with m.page("DE", "de"):
+        pass
+    de = m.browser.contexts[-1].opts
+    assert de["locale"] == "de-DE" and de["extra_http_headers"]["Accept-Language"].startswith("de-DE")
+
+
+async def test_a_fixed_browser_locale_overrides_the_requests_and_is_native_when_it_matches():
+    m = manager(browser_locale="pl-PL", native_locale="pl-PL")
+    await use(m)  # the request says US / en
+    assert "locale" not in m.browser.contexts[0].opts  # Chrome itself is set to pl-PL
+
+
+def test_the_native_locale_goes_to_chrome_as_flag_and_environment():
+    from app.browser import native_args, native_env
+    s = Settings(_env_file=None, native_locale="pl-PL")
+    assert native_args(s) == ["--lang=pl-PL"]
+    env = native_env(s)
+    assert env["LANGUAGE"] == "pl_PL:pl" and env["LANG"] == "pl_PL.UTF-8" and env["LC_ALL"] == "pl_PL.UTF-8"
+    assert native_env(Settings(_env_file=None, native_en_us_languages=False)) is None

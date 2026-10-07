@@ -437,3 +437,34 @@ DEBUG_SCREENSHOT_ON_SUCCESS=true). Tests: 227.
   a launch-level proxy). The app now gives Chrome a dead browser-wide proxy
   (`LAUNCH_PROXY=http://127.0.0.1:9`) when a proxy is configured: re-check showed only
   the proxy endpoint. Page timezone through a mobile line: America/Chicago (exit IP's).
+
+## Phase 13 - Residential sessions, Poland, three parsing fixes
+
+Runs (2026-10-07, dev machine, typed search, all fixes, up to 4 searches per session):
+US residential 13/60 page access (22%), 10 fully valid; Poland residential with a Polish
+browser 41/59 (69%), 23 fully valid. In a reused session Google answers the first /search
+directly (no sei= follow-up); after a session's first page came back, its later searches
+got through 8/9 (US) and 28/29 (Poland). Reports: poc/client_report_resi, _pl.
+
+Fixed along the way: a CAPTCHA at the first typed search was waited on as "/search?" and
+reported as a 15 s timeout (now also matches /sorry/); compare.py counted only sei= passes
+as page access (now also a direct 200 /search with no redirect); the POC diag wrapper of
+_expansion_verified had a fixed signature (500 on every expand click); Chrome on Linux
+ignores --lang, so the browser language is set through the locale environment
+(NATIVE_LOCALE / BROWSER_LOCALE, e.g. pl-PL); Polish consent button.
+
+Three parsing problems from the Poland run (18 of the 41 returned pages):
+1. Sources' "Show all" unconfirmed (7): its code arrived ~5 s after "Show more"; the 2.5 s
+   pre-click wait and 8 s budget ended after one click. Now 4.5 s / AIO_MAX_WAIT_MS=12000
+   (browser test with a 7.5 s late script; old values fail with the live message). The
+   cards were already in the DOM - the rule "every expand control confirmed" is kept.
+2. "No source cards" (6 PL + 2 US): Google's newer panel (div[role=listitem] cards with
+   a.POYEld, .vFyWT, .BEwxRe) and the old card <li> renamed h7wxwc -> Ioqnib. Both read;
+   cards shaped like source links in an unknown layout stay a gap; an overview with no
+   source panel at all (chase bank login - checked on the screenshot) is complete with
+   sources [] and a warning.
+3. Ad sub-links behind /goto unresolved (3): the token-collecting first pass stopped at
+   an ad whose own link was an unresolved /goto, so its sub-links were never collected.
+   Now collected; a parametrized test checks on every fixture that the second pass asks
+   for no token the first pass missed.
+Not yet measured live.

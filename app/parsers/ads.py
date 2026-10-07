@@ -72,6 +72,12 @@ def parse_ads(container: Node | None, ctx: ParseContext | None = None) -> list[A
         url = _resolve_ad_link(href, ctx)
         if title and not url and ctx.links.is_unresolved_goto(href):
             ctx.gap("paid", f"ad {title[:60]!r}: {ctx.link_problem(href)}")
+            # Still ask for the sub-links: the fetcher collects the /goto tokens to resolve
+            # from a first pass with nothing resolved, where this ad stops here. Without
+            # this, its sub-links were never resolved and the second pass (title now
+            # resolved) reported every one of them as a gap.
+            for a in ad_div.css(f"div.{SITELINKS_ROW_CLASS} a[href]"):
+                _resolve_ad_link(a.attributes.get("href"), ctx)
             continue
         if not title or not url:
             warnings.append("ad block missing title or url; skipped")

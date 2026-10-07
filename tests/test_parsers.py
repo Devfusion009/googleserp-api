@@ -276,3 +276,65 @@ def test_aio_bullets_keep_their_nesting_and_all_their_content():
         "  - Best for: Bundling home and auto policies.",
         "  - Get a State Farm Quote",
     ]
+
+
+# --- AI Overview source panel layouts (pages from the 2026-10-07 runs) ---------------
+
+def _aio_with_all_links_resolved(path: str):
+    html = (FIXTURES / path).read_text(encoding="utf-8")
+    first = ParseContext()
+    parse_aio(find_aio_root(HTMLParser(html)), first)  # records the /goto tokens wanted
+    ctx = ParseContext(links=LinkMap({t: f"https://dest.example/{i}" for i, t in enumerate(first.links.wanted)}))
+    return parse_aio(find_aio_root(HTMLParser(html)), ctx), ctx
+
+
+def test_newer_source_cards_are_read():
+    # div[role=listitem] cards with a.POYEld, title .vFyWT, snippet .BEwxRe
+    parsed, ctx = _aio_with_all_links_resolved("aio_sources/wikipedia_cards_v2.html")
+    assert len(parsed.sources) == 6 and not ctx.gaps
+    assert parsed.sources[0].title == "Wikipedia" and parsed.sources[0].snippet.startswith("Wikipedia This article")
+    assert parsed.sources[1].title == "Wikipedia:About"
+
+
+def test_renamed_old_source_cards_are_read():
+    # the old card (a.vIWmYe, .gpZmoc, .hxIQcc) inside li.Ioqnib instead of li.h7wxwc
+    parsed, ctx = _aio_with_all_links_resolved("aio_sources/mobile_cards_renamed.html")
+    assert len(parsed.sources) == 7 and not ctx.gaps
+    assert parsed.sources[0].title == "T-Mobile"
+
+
+def test_an_overview_without_a_source_panel_is_complete():
+    # 'chase bank login': the overview shows only an inline link, no source cards (checked on the screenshot)
+    parsed, ctx = _aio_with_all_links_resolved("aio_sources/chase_no_sources.html")
+    assert parsed.sections and parsed.sources == [] and not ctx.gaps
+    assert "AI Overview shows no source cards" in ctx.warnings
+
+
+def test_source_cards_in_an_unknown_layout_are_a_gap():
+    html = (FIXTURES / "aio_sources/wikipedia_cards_v2.html").read_text(encoding="utf-8").replace('class="POYEld"', 'class="Zz9new"')
+    ctx = ParseContext()
+    parsed = parse_aio(find_aio_root(HTMLParser(html)), ctx)
+    assert parsed.sources == [] and any("not recognised" in g.reason for g in ctx.gaps)
+
+
+# --- /goto tokens: the first pass must collect every token the second pass asks for ---
+
+def _second_pass_gaps(html: str):
+    from app.parsers.registry import PAGE_PARSERS, goto_tokens_needed
+    need = goto_tokens_needed(HTMLParser(html))
+    ctx = ParseContext(links=LinkMap({t: f"https://dest.example/{i}" for i, t in enumerate(need)}))
+    tree = HTMLParser(html)
+    for block_parser in PAGE_PARSERS:
+        block_parser(tree, ctx)
+    return [g for g in ctx.gaps if "not resolved" in g.reason or "/goto" in g.reason]
+
+
+def test_ad_sub_links_behind_goto_are_collected_for_resolution():
+    # Poland run, 'flights to brussels from shanghai': the ad's own link is a /goto too, so
+    # the first pass stopped at it and never collected its sub-links (11 gaps live).
+    assert _second_pass_gaps((FIXTURES / "ads/flights_goto_sublinks.html").read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("path", sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.rglob("*.html") if "classifier" not in p.parts))
+def test_every_goto_token_the_parse_asks_for_was_collected(path):
+    assert _second_pass_gaps((FIXTURES / path).read_text(encoding="utf-8")) == []
