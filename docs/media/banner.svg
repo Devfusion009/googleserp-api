@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" font-family="Inter, 'Segoe UI', 'DejaVu Sans', system-ui, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#13213d"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.04"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="320" rx="18" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="18" fill="url(#grid)"/>
+
+  <!-- left: title -->
+  <g transform="translate(72 0)">
+    <rect y="78" width="56" height="6" rx="3" fill="url(#accent)"/>
+    <text y="146" fill="#f8fafc" font-size="54" font-weight="700" letter-spacing="-1">Google SERP API</text>
+    <text y="192" fill="#94a3b8" font-size="22">Real-browser Google results as structured JSON —</text>
+    <text y="222" fill="#94a3b8" font-size="22">ads, organic, full AI Overview with every source.</text>
+    <g font-size="15" font-weight="600">
+      <rect y="250" width="98" height="30" rx="15" fill="#1e3a8a" fill-opacity="0.6" stroke="#3b82f6" stroke-opacity="0.5"/>
+      <text x="49" y="270" fill="#bfdbfe" text-anchor="middle">FastAPI</text>
+      <rect x="110" y="250" width="112" height="30" rx="15" fill="#134e4a" fill-opacity="0.6" stroke="#14b8a6" stroke-opacity="0.5"/>
+      <text x="166" y="270" fill="#99f6e4" text-anchor="middle">Playwright</text>
+      <rect x="234" y="250" width="132" height="30" rx="15" fill="#3f3f46" fill-opacity="0.6" stroke="#a1a1aa" stroke-opacity="0.5"/>
+      <text x="300" y="270" fill="#e4e4e7" text-anchor="middle">Chrome / CDP</text>
+      <rect x="378" y="250" width="128" height="30" rx="15" fill="#422006" fill-opacity="0.6" stroke="#f59e0b" stroke-opacity="0.5"/>
+      <text x="442" y="270" fill="#fde68a" text-anchor="middle">Python 3.11+</text>
+    </g>
+  </g>
+
+  <!-- right: request -> response card -->
+  <g transform="translate(800 56)">
+    <rect width="408" height="208" rx="14" fill="#0d1117" stroke="#30363d"/>
+    <circle cx="22" cy="20" r="5.5" fill="#ff5f57"/><circle cx="40" cy="20" r="5.5" fill="#febc2e"/><circle cx="58" cy="20" r="5.5" fill="#28c840"/>
+    <g font-family="'JetBrains Mono','DejaVu Sans Mono',monospace" font-size="14">
+      <text x="22" y="58"><tspan fill="#3fb950">POST</tspan><tspan fill="#c9d1d9"> /serp</tspan></text>
+      <text x="22" y="88" fill="#c9d1d9">{</text>
+      <text x="38" y="110"><tspan fill="#7ee787">"status_code"</tspan><tspan fill="#c9d1d9">: </tspan><tspan fill="#ffa657">200</tspan><tspan fill="#c9d1d9">,</tspan></text>
+      <text x="38" y="132"><tspan fill="#7ee787">"organic"</tspan><tspan fill="#c9d1d9">: [ … ],</tspan></text>
+      <text x="38" y="154"><tspan fill="#7ee787">"ai_overview"</tspan><tspan fill="#c9d1d9">: { </tspan><tspan fill="#a5d6ff">"sources"</tspan><tspan fill="#c9d1d9">: [ … ] },</tspan></text>
+      <text x="38" y="176"><tspan fill="#7ee787">"requests_used"</tspan><tspan fill="#c9d1d9">: </tspan><tspan fill="#ffa657">15</tspan></text>
+      <text x="22" y="196" fill="#c9d1d9">}</text>
+    </g>
+  </g>
+</svg>
