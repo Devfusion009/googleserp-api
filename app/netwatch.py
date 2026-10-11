@@ -9,8 +9,10 @@ Three jobs:
     the network; requests the resource blocker aborted never left the browser
     and don't count. Cached responses aren't network requests either.
   - /goto redirects: the status and Location of each /goto answer. Playwright
-    hides the 302 of a fetch(..., {redirect: 'manual'}) once request routing is
-    on (BLOCK_RESOURCES), but CDP still reports it (responseReceivedExtraInfo).
+    hides the 302 of a fetch(..., {redirect: 'manual'}), but CDP reports it
+    (responseReceivedExtraInfo).
+It also blocks images, media and fonts for the page (BLOCK_RESOURCES), through
+CDP rather than Playwright's request routing, which would turn the HTTP cache off.
 """
 import json
 import logging
@@ -34,7 +36,7 @@ _navlog = logging.getLogger("serp.navtrace")
 # non_google: anything else
 REQUEST_KINDS = ("document", "async", "goto", "other_google", "non_google")
 GOOGLE_DOMAINS = ("google.com", "gstatic.com", "googleapis.com", "googleusercontent.com", "googleadservices.com", "doubleclick.net", "youtube.com", "ytimg.com")
-# What Chromium reports for a request the resource blocker aborted (route.abort()).
+# What Chromium reports for a request the resource blocker stopped (Network.setBlockedURLs).
 BLOCKED_ERRORS = {"net::ERR_FAILED", "net::ERR_BLOCKED_BY_CLIENT"}
 
 
@@ -87,12 +89,13 @@ class NetworkWatch:
         self.async_pending: set[str] = set()  # /async/ requests (the AIO loads this way) not finished yet
         self.async_done = 0  # /async/ requests finished or failed since the last reset() or results document
         self._main_frame: str | None = None
+        self._cached: set[str] = set()  # requestIds answered from the HTTP cache - not network requests
         # Scripts in flight and when one last started or ended: Google lazy-loads the code of
         # some AI Overview controls on first use, and a click before it arrives does nothing.
         self.scripts_pending: set[str] = set()
         self.script_activity = 0.0
 
-    async def attach(self, context: BrowserContext, page: Page) -> None:
+    async def attach(self, context: BrowserContext, page: Page, blocked_urls: list[str] | None = None) -> None:
         cdp = await context.new_cdp_session(page)
         tree = await cdp.send("Page.getFrameTree")
         self._main_frame = tree["frameTree"]["frame"]["id"]
@@ -100,6 +103,7 @@ class NetworkWatch:
         cdp.on("Network.responseReceivedExtraInfo", self._on_response_headers)
         cdp.on("Network.loadingFinished", self._on_finished)
         cdp.on("Network.loadingFailed", self._on_failed)
+        cdp.on("Network.requestServedFromCache", self._on_cached)
         if _NAV_TRACE:
             self._doc_ids: set[str] = set()
             cdp.on("Network.requestWillBeSent", self._trace_request)
@@ -108,6 +112,8 @@ class NetworkWatch:
             cdp.on("Network.loadingFailed", self._trace_failed)
             cdp.on("Network.requestWillBeSentExtraInfo", self._trace_request_headers)
         await cdp.send("Network.enable")
+        if blocked_urls:
+            await cdp.send("Network.setBlockedURLs", {"urls": blocked_urls})
 
     def _trace_request_headers(self, ev: dict) -> None:
         # Headers as sent on the wire (cookies included). Can arrive before
@@ -169,6 +175,7 @@ class NetworkWatch:
         self.async_done = 0
         self.scripts_pending.clear()
         self.script_activity = 0.0
+        self._cached.clear()
 
     def scripts_quiet(self, idle_s: float) -> bool:
         """No script in flight, and none started or ended in the last idle_s seconds."""
@@ -186,9 +193,12 @@ class NetworkWatch:
         """/goto token -> Location header, for every /goto request answered with a redirect."""
         return {goto_token(url, any_host=True): self._redirects[rid] for rid, url in self._goto_urls.items() if rid in self._redirects}
 
+    def _on_cached(self, ev: dict) -> None:
+        self._cached.add(ev["requestId"])
+
     def _count(self, request_id: str) -> None:
         url, rtype = self._sent.get(request_id, ("", None))
-        if not url or (request_id, url) in self._counted:
+        if not url or (request_id, url) in self._counted or request_id in self._cached:
             return
         self._counted.add((request_id, url))
         self.requests += 1

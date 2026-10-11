@@ -72,8 +72,11 @@ class GotoResolution:
 async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], s: Settings,
                        out: GotoResolution | None = None) -> GotoResolution:
     """Pass `out` to keep the request/traffic counts even if this is cancelled
-    (e.g. by the request deadline) part-way through."""
+    (e.g. by the request deadline) part-way through. The same `out` can be passed
+    again (links found later on the page): tokens it already resolved are skipped
+    and the counts add up."""
     out = out if out is not None else GotoResolution()
+    tokens = [t for t in tokens if t not in out.resolved]
     base = page.url
     urls = {t: goto_url(t, base) for t in tokens}
 
@@ -84,6 +87,7 @@ async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], 
         elif verdict.url:
             out.resolved[token] = verdict.url
 
+    start = len(out.resolved)
     if net is not None and tokens:
         try:
             await page.evaluate(RESOLVE_IN_PAGE_JS, {"urls": list(urls.values()), "limit": s.goto_concurrency, "timeoutMs": s.goto_timeout_ms})
@@ -98,19 +102,26 @@ async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], 
         for t in tokens:
             if t in locations:
                 take(t, locations[t])
-        out.in_page = len(out.resolved)
+        out.in_page += len(out.resolved) - start
 
     left = [t for t in tokens if t not in out.resolved]
+    after_in_page = len(out.resolved)
     if left and not out.blocked:
         gate = asyncio.Semaphore(max(1, s.goto_concurrency))
 
         async def one(token: str) -> None:
             async with gate:
-                out.fallback_requests += 1
-                try:
-                    resp = await page.context.request.get(urls[token], max_redirects=0, timeout=s.goto_timeout_ms)
-                except PlaywrightError as e:
-                    log.warning("/goto request failed: %s", str(e).splitlines()[0])
+                resp = None
+                # One retry with twice the timeout: live, three fallbacks timed out at 3 s on a
+                # slow proxy and left results unresolved.
+                for attempt, timeout in enumerate((s.goto_timeout_ms, 2 * s.goto_timeout_ms)):
+                    out.fallback_requests += 1
+                    try:
+                        resp = await page.context.request.get(urls[token], max_redirects=0, timeout=timeout)
+                        break
+                    except PlaywrightError as e:
+                        log.warning("/goto request failed (attempt %d): %s", attempt + 1, str(e).splitlines()[0])
+                if resp is None:
                     return
                 out.fallback_bytes += await out_of_page_bytes(resp)
                 if 300 <= resp.status < 400:
@@ -120,7 +131,7 @@ async def resolve_goto(page: Page, net: NetworkWatch | None, tokens: list[str], 
                 await resp.dispose()
 
         await asyncio.gather(*(one(t) for t in left))
-        out.fallback = len(out.resolved) - out.in_page
+        out.fallback += len(out.resolved) - after_in_page
 
     out.unresolved = [t for t in tokens if t not in out.resolved]
     log.info("goto tokens=%d resolved=%d (in_page=%d fallback=%d) blocked=%s",

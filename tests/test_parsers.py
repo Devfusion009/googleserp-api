@@ -338,3 +338,10 @@ def test_ad_sub_links_behind_goto_are_collected_for_resolution():
 @pytest.mark.parametrize("path", sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.rglob("*.html") if "classifier" not in p.parts))
 def test_every_goto_token_the_parse_asks_for_was_collected(path):
     assert _second_pass_gaps((FIXTURES / path).read_text(encoding="utf-8")) == []
+
+
+def test_a_shopping_card_with_href_undefined_is_left_out_not_a_gap():
+    # Long Poland run 2026-10-10: product cards carried href="undefined" and were reported as unresolved sources.
+    parsed, ctx = _aio_with_all_links_resolved("aio_sources/apple_product_href_undefined.html")
+    assert not ctx.gaps and parsed.sources
+    assert any("shopping element" in w for w in ctx.warnings)

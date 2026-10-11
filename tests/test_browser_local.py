@@ -24,6 +24,8 @@ from app.models import SerpRequest
 from app.orchestrator import run_serp
 
 PAGE = """<!doctype html><html><head><style>.tpl-hidden{display:none}</style></head><body>
+<form action="/search" method="GET"><textarea name="q" aria-label="Search"></textarea></form>
+<script>document.querySelector('textarea').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); e.target.form.submit(); } });</script>
 <div id="search"><div id="rso">
   <div data-hveid="r1"><div class="N54PNb"><div><a href="/goto?url=TOKEN_R1"><h3>First result</h3></a></div><div>First snippet text.</div></div></div>
   <div data-hveid="r2"><div class="N54PNb"><div><a href="/goto?url=TOKEN_R2"><h3>Second result</h3></a></div><div>Second snippet text.</div></div></div>
@@ -111,6 +113,13 @@ CONTENTS_PAGE = (
 )
 
 
+# Something over the results page's search box that takes the clicks, and Google's "/"
+# shortcut, which focuses the box.
+COVERED_BOX = """<div style="position:fixed;inset:0;z-index:50"></div>
+<script>document.addEventListener('keydown', e => { if (e.key === '/' && document.activeElement.name !== 'q') {
+  e.preventDefault(); document.querySelector("textarea[name='q']").focus(); } });</script>"""
+
+
 # Google's homepage reduced to what the typed search needs: a form with a q box.
 HOME = """<!doctype html><html><body><form action="/search" method="GET">
 <textarea name="q" aria-label="Search"></textarea><input type="submit" value="Search"></form>
@@ -139,9 +148,43 @@ def _shell_page(fill_after_ms: int | None) -> str:
             + f'<template id="answer">{answer}</template>{fill}' + PAGE[end:])
 
 
+def _sources_show_all(hidden_card: bool) -> str:
+    """The sources panel with an inert 'Show all' (its click does nothing, as when its code has
+    not loaded yet) and, optionally, a third card already in the page but hidden."""
+    third = ('<li class="h7wxwc" style="display:none"><a class="vIWmYe" href="/goto?url=TOKEN_S3"><span class="gpZmoc">Source three</span></a>'
+             '<span class="hxIQcc">Snippet three</span></li>') if hidden_card else ""
+    return (PAGE.replace("</ul>", third + "</ul>", 1)
+            .replace("</ul>", '</ul><div id="all" role="button" style="display:inline-block;padding:4px">Show all</div>', 1)
+            .replace("<!--EXPAND-->", ""))
+
+
+def _sources_show_all_far(extra_card: bool) -> str:
+    """Live layout 2026-10-10: the visible cards sit with 'Show all' (inert here), and the full
+    list is a hidden copy elsewhere in the block - with a card not shown, or only copies."""
+    card = '<li class="h7wxwc"><a class="vIWmYe" href="/goto?url={t}"><span class="gpZmoc">{n}</span></a><span class="hxIQcc">x</span></li>'
+    hidden = card.format(t="TOKEN_S1", n="Source one") + card.format(t="TOKEN_S2", n="Source two")
+    if extra_card:
+        hidden += card.format(t="TOKEN_S3", n="Source three")
+    start = PAGE.index("<ul>")
+    end = PAGE.index("</ul>") + len("</ul>")
+    return (PAGE[:start] + '<div><div>' + PAGE[start:end]
+            + '<div id="all" role="button" style="display:inline-block;padding:4px">Show all</div></div></div>'
+            + f'<div style="display:none"><ul>{hidden}</ul></div>' + PAGE[end:]).replace("<!--EXPAND-->", "")
+
+
 def page_for(variant: str | None) -> str:
+    if variant == "cached_js":
+        return PAGE.replace("<!--EXPAND-->", '<script src="/app.js"></script>')
+    if variant == "showall_far_hidden_cards":
+        return _sources_show_all_far(True)
+    if variant == "showall_far_copies_only":
+        return _sources_show_all_far(False)
     if variant == "contents":
         return CONTENTS_PAGE
+    if variant == "showall_hidden_cards":
+        return _sources_show_all(True)
+    if variant == "showall_no_hidden_cards":
+        return _sources_show_all(False)
     if variant == "shell_late":
         return _shell_page(1200)
     if variant == "shell":
@@ -163,7 +206,14 @@ class FakeGoogle(BaseHTTPRequestHandler):
     # /goto tokens whose first request is answered too late (after the page's
     # fetch timeout), like a stalled proxy connection.
     slow_first: set[str] = set()
+    # /goto tokens whose first request from outside the page (no Sec-Fetch-Mode) is answered late
+    slow_fallback: set[str] = set()
+    slow_home_once = False
     slowed: set[str] = set()
+    app_js_hits = 0
+    cover_box = False
+    goto_times: list[float] = []
+    lazy_js_served: float | None = None
 
     def log_message(self, *a):
         pass
@@ -180,8 +230,12 @@ class FakeGoogle(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         if parts.path == "/goto":
             token = parse_qs(parts.query)["url"][0]
+            type(self).goto_times.append(time.monotonic())
             if token in self.slow_first and token not in self.slowed:
                 self.slowed.add(token)
+                time.sleep(1.5)
+            if token in self.slow_fallback and not self.headers.get("Sec-Fetch-Mode"):
+                type(self).slow_fallback = self.slow_fallback - {token}
                 time.sleep(1.5)
             if token in self.no_redirect_in_page and self.headers.get("Sec-Fetch-Mode"):
                 return self._send(200, b"no redirect for you", [("Content-Type", "text/plain")])
@@ -196,9 +250,15 @@ class FakeGoogle(BaseHTTPRequestHandler):
         if parts.path == "/search":
             type(self).search_queries.append((parse_qs(parts.query).get("q") or [None])[0])
             variant = (parse_qs(parts.query).get("v") or [None])[0]
-            return self._send(200, page_for(variant).encode(), [("Content-Type", "text/html; charset=utf-8")])
+            body = page_for(variant)
+            if self.cover_box:
+                body = body.replace("</body>", COVERED_BOX + "</body>")
+            return self._send(200, body.encode(), [("Content-Type", "text/html; charset=utf-8")])
         if parts.path == "/":
             type(self).home_hits += 1
+            if self.slow_home_once:
+                type(self).slow_home_once = False
+                time.sleep(2.5)
             overlay = CONSENT_OVERLAY_PL if self.consent_on_home == "pl" else CONSENT_OVERLAY
             home = HOME.replace("</body>", overlay + "</body>") if self.consent_on_home else HOME
             return self._send(200, home.encode(), [("Content-Type", "text/html; charset=utf-8")])
@@ -211,7 +271,11 @@ class FakeGoogle(BaseHTTPRequestHandler):
         if parts.path in ("/lazy.js", "/lazy_slow.js"):
             # 4.5 s: longer than three 1.5 s click checks; 7.5 s: the slowest Polish-exit pages
             time.sleep(7.5 if parts.path == "/lazy_slow.js" else 4.5)
+            type(self).lazy_js_served = time.monotonic()
             return self._send(200, LAZY_JS, [("Content-Type", "text/javascript")])
+        if parts.path == "/app.js":  # cacheable, like Google's xjs bundles
+            type(self).app_js_hits += 1
+            return self._send(200, b"window.__app = 1;", [("Content-Type", "text/javascript"), ("Cache-Control", "public, max-age=3600")])
         if parts.path == "/image.png":
             type(self).image_hits += 1
         return self._send(404)
@@ -226,6 +290,9 @@ def fake_google():
     FakeGoogle.consent_on_home = False
     FakeGoogle.search_queries = []
     FakeGoogle.no_redirect_in_page, FakeGoogle.slow_first, FakeGoogle.slowed = set(), set(), set()
+    FakeGoogle.slow_fallback, FakeGoogle.slow_home_once = set(), False
+    FakeGoogle.app_js_hits, FakeGoogle.goto_times, FakeGoogle.lazy_js_served = 0, [], None
+    FakeGoogle.cover_box = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeGoogle)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
@@ -265,6 +332,27 @@ async def test_goto_links_resolve_in_page_and_the_page_is_valid(fake_google, bro
     assert [o.url for o in page.organic] == ["https://dest.example/token_r1", "https://dest.example/token_r2"]
     assert [s.url for s in page.ai_overview.sources] == ["https://dest.example/token_s1", "https://dest.example/token_s2"]
     assert page.ai_overview.intro and page.ai_overview.sections[0].title == "How it works"
+
+
+async def test_blocking_images_keeps_the_http_cache(fake_google, browsers):
+    # Playwright's request routing would turn the cache off and refetch the script every search.
+    settings, manager = browsers
+    fetcher = Fetcher(settings, manager)
+    for _ in range(2):
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=cached_js"), fetcher, settings)
+        assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert FakeGoogle.app_js_hits == 1 and FakeGoogle.image_hits == 0
+    assert out.requests_used == 5  # the cached script is not a network request
+
+
+async def test_result_links_resolve_while_the_aio_is_still_loading(fake_google, browsers):
+    settings, manager = browsers
+    settings.aio_max_wait_ms = Settings(_env_file=None).aio_max_wait_ms
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=lazy_slow"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert FakeGoogle.goto_times and FakeGoogle.lazy_js_served and max(FakeGoogle.goto_times) < FakeGoogle.lazy_js_served
+    # resolved once each, all in the page, though in two passes
+    assert out.first.timings["links_resolved"] == out.first.timings["links_in_page"] == 4 and out.first.usage["goto"] == 4
 
 
 async def test_display_contents_wrappers_do_not_hide_the_aio(fake_google, browsers):
@@ -362,6 +450,42 @@ async def test_a_control_whose_code_takes_7_s_to_load_is_expanded_within_the_def
     settings.aio_max_wait_ms = Settings(_env_file=None).aio_max_wait_ms
     out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=lazy_slow"), Fetcher(settings, manager), settings)
     assert out.ok, f"{out.error_code}: {out.error_message}"
+
+
+async def test_a_show_all_whose_hidden_cards_are_in_the_page_is_complete_without_a_click(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=showall_hidden_cards"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sources] == ["Source one", "Source two", "Source three"]
+
+
+async def test_a_show_all_with_nothing_hidden_behind_it_must_still_be_expanded(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=showall_no_hidden_cards"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete" and "Show all" in out.error_message, out.error_message
+
+
+async def test_hidden_cards_far_from_show_all_still_count(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=showall_far_hidden_cards"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert [s.title for s in out.pages[0].ai_overview.sources] == ["Source one", "Source two", "Source three"]
+
+
+async def test_hidden_copies_of_visible_cards_do_not_excuse_show_all(fake_google, browsers):
+    settings, manager = browsers
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&v=showall_far_copies_only"), Fetcher(settings, manager), settings)
+    assert not out.ok and out.error_code == "aio_incomplete" and "Show all" in out.error_message, out.error_message
+
+
+async def test_a_fallback_goto_lookup_that_times_out_is_retried(fake_google, browsers):
+    settings, manager = browsers
+    settings.goto_timeout_ms = 1000
+    FakeGoogle.no_redirect_in_page = {"TOKEN_S2"}  # forces the fallback for this link
+    FakeGoogle.slow_fallback = {"TOKEN_S2"}  # whose first fallback request is answered after 1.5 s
+    out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns"), Fetcher(settings, manager), settings)
+    assert out.ok, f"{out.error_code}: {out.error_message}"
+    assert out.first.usage["goto_fallback"] == 2  # the timed-out try and the retry, both counted
 
 
 async def test_fallback_goto_traffic_is_counted_and_marked_partial(fake_google, browsers):
@@ -468,6 +592,90 @@ async def test_typed_search_opens_the_homepage_types_the_query_and_returns_the_s
         assert FakeGoogle.search_queries == ["dns"]  # and the query reached /search by typing + Enter
         assert [o.url for o in out.pages[0].organic] == ["https://dest.example/token_r1", "https://dest.example/token_r2"]
         assert out.pages[0].ai_overview.sections[0].title == "How it works"
+    finally:
+        await manager.stop()
+
+
+async def test_a_homepage_that_times_out_once_is_loaded_again(fake_google):
+    FakeGoogle.slow_home_once = True
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2,
+                                       nav_timeout_ms=2000, debug_artifacts=False)
+    try:
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&gl=us&hl=en"), Fetcher(settings, manager), settings)
+        assert out.ok, f"{out.error_code}: {out.error_message}"
+        assert FakeGoogle.home_hits == 2
+    finally:
+        await manager.stop()
+
+
+async def test_a_session_already_served_results_types_the_next_query_on_the_results_page(fake_google):
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2,
+                                       typed_warmup_min_ms=800, typed_warmup_max_ms=800, debug_artifacts=False)
+    try:
+        fetcher = Fetcher(settings, manager)
+        first = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns&gl=us&hl=en"), fetcher, settings)
+        second = await run_serp(SerpRequest(url=f"{fake_google}/search?q=caching&gl=us&hl=en"), fetcher, settings)
+        assert first.ok and second.ok, f"{second.error_code}: {second.error_message}"
+        assert FakeGoogle.home_hits == 1  # the second search did not go back to the homepage
+        assert FakeGoogle.search_queries == ["dns", "caching"]
+        assert second.first.timings["nav_ms"] < first.first.timings["nav_ms"]  # no homepage, no pause
+    finally:
+        await manager.stop()
+
+
+async def test_a_covered_search_box_on_the_results_page_is_reached_with_the_slash_shortcut(fake_google):
+    FakeGoogle.cover_box = True
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2, debug_artifacts=False)
+    try:
+        fetcher = Fetcher(settings, manager)
+        for q in ("dns", "caching"):
+            out = await run_serp(SerpRequest(url=f"{fake_google}/search?q={q}&gl=us&hl=en"), fetcher, settings)
+            assert out.ok, f"{out.error_code}: {out.error_message}"
+        assert FakeGoogle.home_hits == 1 and FakeGoogle.search_queries == ["dns", "caching"]
+    finally:
+        await manager.stop()
+
+
+async def test_the_results_page_fast_path_can_be_turned_off(fake_google):
+    settings, manager = await _manager(search_mode="typed", typed_key_delay_min_ms=1, typed_key_delay_max_ms=2,
+                                       typed_on_results_page=False, debug_artifacts=False)
+    try:
+        fetcher = Fetcher(settings, manager)
+        for q in ("dns", "caching"):
+            assert (await run_serp(SerpRequest(url=f"{fake_google}/search?q={q}&gl=us&hl=en"), fetcher, settings)).ok
+        assert FakeGoogle.home_hits == 2
+    finally:
+        await manager.stop()
+
+
+async def test_a_new_session_opens_the_warm_up_pages_before_its_first_search(fake_google):
+    settings, manager = await _manager(warmup_urls=f"{fake_google}/ip, {fake_google}/", warmup_dwell_min_ms=10, warmup_dwell_max_ms=20,
+                                       debug_artifacts=False)
+    try:
+        assert FakeGoogle.ip_hits == 1 and FakeGoogle.home_hits == 1  # opened at startup (prewarm), before any request
+        out = await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns"), Fetcher(settings, manager), settings)
+        assert out.ok
+    finally:
+        await manager.stop()
+
+
+async def test_warm_up_answers_the_consent_dialog(fake_google):
+    FakeGoogle.consent_on_home = "pl"
+    settings, manager = await _manager(warmup_urls=f"{fake_google}/", warmup_dwell_min_ms=10, warmup_dwell_max_ms=20,
+                                       debug_artifacts=False)
+    try:
+        slot = manager._slots.get_nowait()
+        assert FakeGoogle.home_hits == 1 and await slot.page.locator("#consent").count() == 0  # "Odrzuć wszystko" pressed
+        manager._slots.put_nowait(slot)
+    finally:
+        await manager.stop()
+
+
+async def test_the_exit_ip_check_after_a_request_can_be_turned_off(fake_google):
+    settings, manager = await _manager(exit_ip_check_url=f"{fake_google}/ip", exit_ip_check_after=False, debug_artifacts=False)
+    try:
+        assert (await run_serp(SerpRequest(url=f"{fake_google}/search?q=dns"), Fetcher(settings, manager), settings)).ok
+        assert FakeGoogle.ip_hits == 1  # only the check when the session was built
     finally:
         await manager.stop()
 

@@ -219,8 +219,10 @@ async def test_a_click_while_scripts_load_is_awaited_not_repeated():
     assert page.clicks == ["1"]
 
 
-async def test_a_click_waits_for_scripts_to_go_quiet_first():
-    page, net = FakePage([("Show all", ["hide"])]), ScriptNet()
+async def test_a_control_revealed_by_an_expansion_waits_for_scripts_to_go_quiet():
+    # The overview's own 'Show more' is clicked right away; the 'Show all' that follows it
+    # waits for the code Google loads after the first expansion.
+    page, net = FakePage([("Show more", ["hide"]), ("Show all", ["hide"])]), ScriptNet()
     net.scripts_pending = {"s1"}
     clicked_while_loading = []
     real_locator = page.locator
@@ -240,7 +242,7 @@ async def test_a_click_waits_for_scripts_to_go_quiet_first():
     ok, reason = await fetcher(max_wait_ms=6000)._wait_aio(page, net)
     await task
     assert ok, reason
-    assert clicked_while_loading == [False]
+    assert clicked_while_loading == [True, False]
 
 
 async def test_scripts_that_never_go_quiet_do_not_block_the_click():
@@ -249,3 +251,47 @@ async def test_scripts_that_never_go_quiet_do_not_block_the_click():
     ok, reason = await fetcher(max_wait_ms=6000)._wait_aio(page, net)
     assert ok, reason
     assert page.clicks == ["1"]
+
+
+async def test_a_show_all_whose_cards_are_already_in_the_page_is_not_clicked():
+    # Live: the sources' 'Show all' could not be confirmed in time, but every card it reveals
+    # was already in the page (hidden). Such a 'Show all' is not pending.
+    page = FakePage([("Show more", ["hide"]), ("Show all", ["nothing"] * 3)])
+    real_evaluate = page.evaluate
+
+    async def evaluate(js, *args):
+        probe = await real_evaluate(js, *args)
+        for b in probe["buttons"]:
+            b["hiddenCards"] = 6 if b["label"] == "Show all" else 0
+        return probe
+
+    page.evaluate = evaluate
+    ok, reason = await fetcher()._wait_aio(page)
+    assert ok and reason == "AI Overview complete"
+    assert page.clicks == ["1"]  # only 'Show more'
+
+
+async def test_a_show_all_without_hidden_cards_in_the_page_is_still_clicked():
+    page = FakePage([("Show all", ["hide"])])
+    ok, reason = await fetcher()._wait_aio(page)
+    assert ok and page.clicks == ["1"]
+
+
+async def test_page_html_is_read_again_while_the_page_is_navigating():
+    from app.fetcher import _page_html
+
+    class Navigating:
+        def __init__(self):
+            self.calls = 0
+
+        async def content(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise PlaywrightError("Page.content: Unable to retrieve content because the page is navigating and changing the content.")
+            return "<html>ok</html>"
+
+        async def wait_for_load_state(self, state):
+            pass
+
+    page = Navigating()
+    assert await _page_html(page) == "<html>ok</html>" and page.calls == 2

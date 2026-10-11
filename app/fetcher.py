@@ -6,6 +6,7 @@ buttons (no href) inside the AI Overview block. Once the page is captured, the
 (app/goto_resolver.py) while the page and its proxy session are still open.
 """
 import asyncio
+import contextlib
 import logging
 import random
 import re
@@ -23,6 +24,7 @@ from selectolax.parser import HTMLParser
 from .browser import PagePool, PageSlot
 from .classify import HIDDEN_MARK, AioState, Classification, classify_page
 from .config import Settings
+from .consent import reject_consent
 from .goto_resolver import GotoResolution, resolve_goto
 from .netwatch import NetworkWatch
 from .parsers.registry import goto_tokens_needed
@@ -69,6 +71,7 @@ AIO_PROBE_JS = r"""
   // Google's newer layout puts the AI Overview's own "Show more" outside the block, far up
   // the tree; it is the button whose aria-label names it ("Show more AI Overview").
   const own = /^show (more|all) ai overview$/i;
+  const CARD_LINKS = 'a.vIWmYe, a.POYEld';
   // That button goes first: until it is expanded, other controls of the block (the sources'
   // "Show all") are covered and a click on them times out.
   const candidates = new Set([
@@ -83,7 +86,19 @@ AIO_PROBE_JS = r"""
       window.__serpBtnSeq = (window.__serpBtnSeq || 0) + 1;
       b.setAttribute('data-serp-btn', String(window.__serpBtnSeq));
     }
-    buttons.push({id: b.getAttribute('data-serp-btn'), label, visible: shown(b), expanded: b.getAttribute('aria-expanded')});
+    // A sources 'Show all' reveals cards that are already in the page, hidden: count the
+    // hidden cards in the block that are not copies of a visible one. They can sit far from
+    // the button (live 2026-10-10: 3 visible cards next to it, the other 4-6 in a hidden
+    // list elsewhere in the block), so the whole block is searched.
+    let hiddenCards = 0;
+    if (/^show all/i.test(label)) {
+      const key = a => (a.getAttribute('href') || '') + '|' + (a.getAttribute('aria-label') || '');
+      const links = [...node.querySelectorAll(CARD_LINKS)];
+      const isShown = a => shown(a.closest('li,[role=listitem]') || a) && shown(a);
+      const visible = new Set(links.filter(isShown).map(key));
+      hiddenCards = new Set(links.filter(a => !isShown(a)).map(key).filter(k => !visible.has(k))).size;
+    }
+    buttons.push({id: b.getAttribute('data-serp-btn'), label, visible: shown(b), expanded: b.getAttribute('aria-expanded'), hiddenCards});
   }
   // Answer text the parser reads (intro paragraph, section heading or bullet). The shell
   // Google sends first ("AI Mode reply for ..." over a "Searching" skeleton) has none.
@@ -115,11 +130,28 @@ STABLE_S = 0.3
 AIO_SHELL_CHARS = 200
 
 
+async def _page_html(page: Page) -> str:
+    """page.content(), retried while the page is still navigating (seen live: "Unable to
+    retrieve content because the page is navigating and changing the content")."""
+    for attempt in range(3):
+        try:
+            return await page.content()
+        except PlaywrightError as e:
+            if "navigating" not in str(e) or attempt == 2:
+                raise
+            await page.wait_for_load_state("domcontentloaded")
+    raise AssertionError("unreachable")
+
+
 def _pending_expanders(probe: dict, done: set[str]) -> list[dict]:
-    """Visible 'Show more' / 'Show all' controls not yet expanded."""
+    """Visible 'Show more' / 'Show all' controls not yet expanded. A sources 'Show all'
+    whose panel already holds hidden source cards is not pending: what it reveals is in
+    the page and the parser reads it (live, its code loaded only seconds after 'Show more'
+    and its click could not be confirmed within the budget - the cards were all there)."""
     return [
         b for b in probe["buttons"]
         if b["visible"] and b["label"].lower() in EXPAND_LABELS and b.get("expanded") != "true" and b["id"] not in done
+        and not (b["label"].lower() == "show all" and b.get("hiddenCards", 0) > 0)
     ]
 
 
@@ -287,29 +319,48 @@ class Fetcher:
         qs = parse_qs(urlsplit(url).query)
         return self.s.search_mode == "typed" and bool(qs.get("q")) and not qs.get("start")
 
-    async def _reject_consent(self, page: Page) -> None:
-        """The "Before you continue to Google" dialog covers the homepage for a context with no
-        consent cookie (typical on UK/EU exits) and blocks the search box. Press its "Reject all"
-        button, in the page or in a consent iframe, as a visitor would; this sets the consent
-        cookie for the context. No-op when the dialog is absent."""
-        # The dialog follows the browser's language: English, or Polish behind Polish exits
-        # with a pl-PL browser (BROWSER_LOCALE), German for de-DE.
-        name = re.compile(r"^\s*(reject all|odrzuć wszystko|alle ablehnen)\s*$", re.I)
-        for frame in page.frames:
-            btn = frame.get_by_role("button", name=name).first
+    @staticmethod
+    def _is_results_page(current: str, target: str) -> bool:
+        """Is the page on a results page of the host the new search goes to?"""
+        cur, tgt = urlsplit(current or ""), urlsplit(target)
+        return cur.hostname == tgt.hostname and cur.path == "/search"
+
+    async def _typed_search_on_results(self, page: Page, url: str) -> None:
+        """In a session already on a Google results page: replace the query in that page's
+        search box and press Enter, as a visitor refining a search. Falls back to the
+        homepage path when the box can't be used."""
+        query = parse_qs(urlsplit(url).query)["q"][0]
+        # The page is left scrolled down by the previous search (AI Overview expanded), and live
+        # the box then could not be clicked within 3 s (3 of 7 searches, 2026-10-10): back to the
+        # top first, as a visitor would, and if the click still fails, Google's "/" shortcut.
+        await page.evaluate("window.scrollTo(0, 0)")
+        box = page.locator("textarea[name='q']:visible, input[name='q']:visible").first
+        try:
             try:
-                if not await btn.is_visible():
-                    continue
-                await btn.click(timeout=2000)
-            except PlaywrightError:
-                continue
-            log.info("typed search: rejected consent dialog on %s", page.url)
-            try:
-                await btn.wait_for(state="hidden", timeout=3000)
-            except PlaywrightError:
-                pass
-            await page.wait_for_load_state("domcontentloaded")
+                await box.click(timeout=2000)
+            except PlaywrightError as e:
+                log.warning("typed search on results page: box click failed (%s); trying '/'",
+                            " | ".join(str(e).splitlines()[:4])[:300])
+                await page.keyboard.press("Escape")
+                await page.keyboard.press("/")
+                if not await page.evaluate("document.activeElement && document.activeElement.name === 'q'"):
+                    raise
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+        except PlaywrightError as e:
+            log.warning("typed search on results page: box not usable (%s); going through the homepage", str(e).splitlines()[0][:120])
+            await self._typed_search(page, url)
             return
+        lo, hi = sorted((self.s.typed_key_delay_min_ms, self.s.typed_key_delay_max_ms))
+        await page.keyboard.type(query, delay=random.randint(lo, hi))
+        await page.wait_for_timeout(random.randint(100, 300))
+        before = page.url
+        await page.keyboard.press("Enter")
+        # "commit", not "domcontentloaded": live, the results HTML had fully arrived but a
+        # script stalled on the proxy held DOMContentLoaded back past the timeout (2 of 60 in
+        # the 2026-10-10 Poland run). The caller's wait for #search/#rso covers readiness.
+        await page.wait_for_url(lambda u: u != before and ("/search?" in u or "/sorry/" in u),
+                                wait_until="commit", timeout=self.s.nav_timeout_ms)
 
     async def _typed_search(self, page: Page, url: str) -> None:
         """Google homepage -> click the search box -> type the query -> Enter. Leaves the page
@@ -320,10 +371,17 @@ class Fetcher:
         home_params = {k: qs[k][0] for k in ("hl", "gl") if qs.get(k)}
         home = urlunsplit((parts.scheme, parts.netloc, "/", urlencode(home_params), ""))
         timeout = self.s.nav_timeout_ms
-        await page.goto(home, wait_until="domcontentloaded", timeout=timeout)
+        try:
+            await page.goto(home, wait_until="domcontentloaded", timeout=timeout)
+        except PlaywrightTimeout:
+            # A slow stretch of the proxy (long Poland run: six homepage loads in a row hit the
+            # 15 s timeout). One more try on the same session before giving up.
+            log.warning("typed search: homepage load timed out; retrying once")
+            await page.goto("about:blank")  # cancel the stuck load, or it aborts the retry when it lands
+            await page.goto(home, wait_until="domcontentloaded", timeout=timeout)
         if "/sorry/" in page.url or urlsplit(page.url).hostname == "consent.google.com":
             return
-        await self._reject_consent(page)
+        await reject_consent(page)
         lo_w, hi_w = sorted((self.s.typed_warmup_min_ms, self.s.typed_warmup_max_ms))
         if hi_w > 0:
             await page.wait_for_timeout(random.randint(lo_w, hi_w))
@@ -340,12 +398,18 @@ class Fetcher:
         # Results, or Google's CAPTCHA page: a block at the first search redirects to
         # /sorry/index?continue=...search%3F... (encoded), which "/search?" alone never
         # matched - the wait ran to its timeout and the block was reported as a timeout.
-        await page.wait_for_url(re.compile(r"/search\?|/sorry/"), wait_until="domcontentloaded", timeout=timeout)
+        # "commit" for the same reason as in _typed_search_on_results.
+        await page.wait_for_url(re.compile(r"/search\?|/sorry/"), wait_until="commit", timeout=timeout)
 
     async def _run(self, slot: PageSlot, url: str, res: FetchResult, t0: float) -> None:
         page = slot.page
-        log.info("navigate url_sent=%s mode=%s", url, "typed" if self._use_typed_search(url) else "url")
-        if self._use_typed_search(url):
+        on_results = (self._use_typed_search(url) and self.s.typed_on_results_page and getattr(slot, "served_results", False)
+                      and self._is_results_page(page.url, url))
+        mode = "typed-on-results" if on_results else ("typed" if self._use_typed_search(url) else "url")
+        log.info("navigate url_sent=%s mode=%s", url, mode)
+        if on_results:
+            await self._typed_search_on_results(page, url)
+        elif self._use_typed_search(url):
             await self._typed_search(page, url)
         else:
             await page.goto(url, wait_until="domcontentloaded", timeout=self.s.nav_timeout_ms)
@@ -354,7 +418,7 @@ class Fetcher:
         if page.url != url:
             log.info("final url differs: %s", page.url)
 
-        early = classify_page(page.url, await page.content())
+        early = classify_page(page.url, await _page_html(page))
         if early.classification in (Classification.blocked_captcha, Classification.consent_wall):
             res.classification, res.reason = early.classification, early.reason
             await self._finish(page, res)
@@ -363,7 +427,7 @@ class Fetcher:
         try:
             await page.wait_for_selector("#search, #rso", timeout=self.s.nav_timeout_ms)
         except PlaywrightTimeout:
-            res.html = await page.content()
+            res.html = await _page_html(page)
             v = classify_page(page.url, res.html)
             res.classification = v.classification if v.classification is not Classification.ok else Classification.degraded_page
             res.reason = v.reason if v.classification is not Classification.ok else "results container never appeared"
@@ -371,18 +435,42 @@ class Fetcher:
             return
         res.timings["results_ms"] = _ms(t0)
 
+        # The result links already on the page are resolved while the AI Overview loads, not
+        # after it (live, the two stages took ~1.5 s each one after the other); _resolve_links
+        # then does only what appeared later (the overview's source cards).
+        prefetch = None
+        if self.s.goto_prefetch:
+            tokens = goto_tokens_needed(HTMLParser(await _page_html(page)))
+            if tokens:
+                res.goto = GotoResolution()
+                prefetch = asyncio.create_task(resolve_goto(page, getattr(slot, "net", None), tokens, self.s, out=res.goto))
+        try:
+            await self._settle_and_classify(slot, res, t0, prefetch)
+        finally:
+            if prefetch is not None and not prefetch.done():
+                prefetch.cancel()
+                with contextlib.suppress(asyncio.CancelledError, PlaywrightError):
+                    await prefetch
+
+    async def _settle_and_classify(self, slot: PageSlot, res: FetchResult, t0: float, prefetch: asyncio.Task | None) -> None:
+        page = slot.page
         aio_ok, aio_reason = await self._wait_aio(page, getattr(slot, "net", None))
         res.timings["aio_ms"] = _ms(t0)
 
         await page.evaluate(MARK_HIDDEN_JS, HIDDEN_MARK)
-        res.html = await page.content()
+        res.html = await _page_html(page)
         res.final_url = page.url
         v = classify_page(page.url, res.html)
         res.classification, res.reason, res.aio_state = v.classification, v.reason, v.aio_state
+        if v.classification in (Classification.ok, Classification.aio_incomplete, Classification.parse_error):
+            slot.served_results = True  # Google served this session a results page
         # The wait's reason says more than the classifier's (what it waited for, how long).
         if not aio_ok and v.classification in (Classification.ok, Classification.aio_incomplete):
             res.classification, res.reason, res.aio_state = Classification.aio_incomplete, aio_reason, AioState.incomplete
         if res.classification is Classification.ok:
+            if prefetch is not None:
+                with contextlib.suppress(PlaywrightError):
+                    await prefetch
             await self._resolve_links(slot, res, t0)
         if res.classification is Classification.ok and self.s.repo_state_file:
             await page.context.storage_state(path=self.s.repo_state_file)
@@ -395,8 +483,11 @@ class Fetcher:
         res.timings["links_needed"] = len(tokens)
         if not tokens:
             return
-        # Created here so its request/traffic counts survive a deadline cancel.
-        res.goto = outcome = GotoResolution()
+        # Created before the call so its request/traffic counts survive a deadline cancel;
+        # it already holds what the prefetch during the AI Overview wait resolved.
+        if res.goto is None:
+            res.goto = GotoResolution()
+        outcome = res.goto
         await resolve_goto(slot.page, getattr(slot, "net", None), tokens, self.s, out=outcome)
         res.links = outcome.resolved
         res.timings["links_resolved"] = len(outcome.resolved)
@@ -457,7 +548,8 @@ class Fetcher:
                 if attempts.get(bid, 0) >= MAX_EXPAND_ATTEMPTS:
                     return False, f"could not expand '{label}' after {MAX_EXPAND_ATTEMPTS} attempts ({problem.get(bid, 'no visible change')})"
                 attempts[bid] = attempts.get(bid, 0) + 1
-                await self._wait_scripts_quiet(page, net, end)
+                if done:  # only a control revealed by an earlier expansion waits for lazily loaded code
+                    await self._wait_scripts_quiet(page, net, end)
                 before_url = page.url
                 remaining_ms = int((end - time.perf_counter()) * 1000)
                 clicked = False
@@ -506,7 +598,7 @@ class Fetcher:
 
     async def _finish(self, page: Page, res: FetchResult, capture: bool = True) -> None:
         if capture or res.html is None:
-            res.html = await page.content()
+            res.html = await _page_html(page)
         if self.s.debug_artifacts:
             out = Path(self.s.artifacts_dir) / f"{time.strftime('%Y%m%d_%H%M%S')}_{_slug(res.url_sent)}"
             out.mkdir(parents=True, exist_ok=True)

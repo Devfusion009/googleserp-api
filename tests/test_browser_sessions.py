@@ -1,4 +1,6 @@
 """Proxy sessions and exit-IP changes in BrowserManager, with a fake browser."""
+import base64
+
 import pytest
 
 from app.browser import BrowserManager, Slot, parse_exit_check, parse_ip
@@ -70,6 +72,9 @@ PROXY = "http://user-session-{session}:pw@proxy.example:8000"
 
 
 def manager(ips=(), **settings):
+    # The login goes to Playwright here, where these tests read it; the local forwarder that
+    # holds it instead by default is tested below.
+    settings = {"proxy_local_forwarder": False, **settings}
     s = Settings(_env_file=None, proxy_mode="static", proxy_url=PROXY, **settings)
     m = BrowserManager(s, StaticProxy(PROXY))
     m.browser = FakeBrowser(ips)
@@ -96,6 +101,22 @@ async def test_every_context_gets_its_own_sticky_session_id():
     names = usernames(m)
     assert len(names) == 2 and all(n.startswith("user-session-") and "{session}" not in n for n in names)
     assert names[0] != names[1]  # a new context never reuses the old session
+
+
+async def test_with_the_local_forwarder_chrome_gets_no_login_and_each_session_its_own():
+    m = manager(proxy_local_forwarder=True)
+    slot = await use(m)
+    first = slot.forwarder
+    opts = m.browser.contexts[0].opts["proxy"]
+    assert opts["server"] == first.url and opts["server"].startswith("http://127.0.0.1:") and "username" not in opts
+    login = base64.b64decode(first._auth.split(b"Basic ")[1].strip()).decode()
+    assert login == f"user-session-{slot.session}:pw"
+    slot.retire = "test"
+    slot = await use(m)
+    assert slot.forwarder is not first and first._server is None  # the old one is closed
+    assert base64.b64decode(slot.forwarder._auth.split(b"Basic ")[1].strip()).decode() == f"user-session-{slot.session}:pw"
+    await m._close(slot, "test end")
+    assert slot.forwarder is None
 
 
 async def test_session_is_rotated_between_requests_once_too_old():
