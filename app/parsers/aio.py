@@ -115,10 +115,11 @@ def _list_depth(li: Node, root: Node) -> int:
 
 
 def _is_product_card(link: Node | None, href: str | None) -> bool:
-    """Google's shopping card in the sources panel: no href, role=button and a
-    product cluster id (data-cid). Anything else without a usable link is a
-    citation we failed to resolve."""
-    return link is not None and not href and link.attributes.get("role") == "button" and bool(link.attributes.get("data-cid"))
+    """Google's shopping card in the sources panel: no href (missing, or the literal
+    string "undefined" in pages from 2026-10-10), role=button and a product cluster id
+    (data-cid). Anything else without a usable link is a citation we failed to resolve."""
+    return (link is not None and (not href or href == "undefined") and link.attributes.get("role") == "button"
+            and bool(link.attributes.get("data-cid")))
 
 
 def _card_title(item: Node, link: Node | None, newer: bool) -> str | None:

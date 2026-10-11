@@ -135,9 +135,12 @@ async def test_fallback_resolves_what_the_page_missed_without_following_redirect
     assert out.resolved == {"A": "https://a.example/1", "B": "https://b.example/2"}
     assert out.unresolved == ["C", "D"] and out.fallback == 1
     assert all(kw["max_redirects"] == 0 for _, kw in page.context.request.calls)
-    # B and C answered, D failed on the network: 3 requests left the page and
-    # the two answers are counted byte for byte (status line + headers + body).
-    assert out.fallback_requests == 3
+    # B and C answered, D failed on the network twice (the try and one retry with twice
+    # the timeout): 4 requests left the page, and the two answers are counted byte for
+    # byte (status line + headers + body).
+    assert out.fallback_requests == 4
+    d_calls = [kw["timeout"] for url, kw in page.context.request.calls if url.endswith("url=D")]
+    assert d_calls == [S.goto_timeout_ms, 2 * S.goto_timeout_ms]
     b = len("HTTP/1.1 302 Found\r\n") + len("Location") + len("https://b.example/2") + 4 + 2
     c = len("HTTP/1.1 200 OK\r\n") + 2
     assert out.fallback_bytes == b + c

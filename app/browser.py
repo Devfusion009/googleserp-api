@@ -29,20 +29,24 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncContextManager, Protocol
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from .config import Settings
+from .consent import reject_consent
 from .netwatch import NetworkWatch, out_of_page_bytes
 from .proxy import ProxyProvider, make_provider, mask_proxy, to_playwright
+from .proxy_forwarder import ProxyForwarder
 
 # Init script from web-agent-master/google-search (src/search.ts), applied to every page.
 REPO_FINGERPRINT_JS = """
@@ -76,6 +80,17 @@ log = logging.getLogger("serp.browser")
 def native_args(s: Settings) -> list[str]:
     """Chrome's own language setting (Settings.native_locale), when native languages are on."""
     return [f"--lang={s.native_locale}"] if s.native_en_us_languages and s.native_locale else []
+
+
+def launch_args(s: Settings) -> list[str]:
+    """Chrome switches every launch gets (the app's and the POC runner's)."""
+    args = native_args(s)
+    if s.proxy_mode != "none" and s.webrtc_proxy_only:
+        # WebRTC asks the OS for addresses and sends UDP past the proxy, which can reveal the
+        # machine's own IP next to the proxy's; this keeps it to the proxy (Chrome's
+        # WebRtcIPHandlingPolicy "disable_non_proxied_udp", as privacy extensions set it).
+        args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+    return args
 
 
 def native_env(s: Settings) -> dict[str, str] | None:
@@ -124,7 +139,9 @@ class Slot:
     report: dict = field(default_factory=dict)
     ip_checked_at: float | None = None  # monotonic time of the last exit-IP check that answered
     exit_tz: str | None = None  # timezone named by the last exit-IP check
+    served_results: bool = False  # Google has served this context a results page
     timezone: str | None = None  # the context's timezone (None: the host's)
+    forwarder: ProxyForwarder | None = None  # local proxy holding the upstream login (PROXY_LOCAL_FORWARDER)
 
 
 def locale_for(country: str | None, language: str | None) -> str:
@@ -191,7 +208,7 @@ class BrowserManager:
             kwargs["executable_path"] = self.s.browser_executable_path
         if self.s.repo_fingerprint:
             kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
-        kwargs["args"] = kwargs.get("args", []) + native_args(self.s)
+        kwargs["args"] = kwargs.get("args", []) + launch_args(self.s)
         if native_env(self.s):
             kwargs["env"] = native_env(self.s)
         if self.s.proxy_mode != "none" and self.s.launch_proxy:
@@ -224,17 +241,12 @@ class BrowserManager:
             slot = self._slots.get_nowait()
             if slot.context:
                 await slot.context.close()
+            if slot.forwarder is not None:
+                await slot.forwarder.close()
         if self.browser:
             await self.browser.close()
         if self._pw:
             await self._pw.stop()
-
-    async def _block(self, route: Route) -> None:
-        blocked = set(self.s.blocked_resource_types.split(","))
-        if route.request.resource_type in blocked:
-            await route.abort()
-        else:
-            await route.continue_()
 
     async def exit_ip(self, slot: Slot) -> str | None:
         """The slot's current exit IP via EXIT_IP_CHECK_URL (through its proxy), or
@@ -267,6 +279,9 @@ class BrowserManager:
             except Exception:
                 pass
         slot.context = slot.page = slot.net = None
+        if slot.forwarder is not None:
+            await slot.forwarder.close()
+            slot.forwarder = None
 
     async def _build(self, slot: Slot, template: str | None, locale: str) -> None:
         assert self.browser is not None
@@ -276,7 +291,15 @@ class BrowserManager:
         opts = dict(viewport=viewport, screen={"width": self.s.screen_width, "height": self.s.screen_height})
         if not (self.s.native_en_us_languages and locale == self.s.native_locale):
             opts.update(locale=locale, extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9"})
-        if proxy:
+        if slot.forwarder is not None:  # left over from a context that broke
+            await slot.forwarder.close()
+            slot.forwarder = None
+        if proxy and self.s.proxy_local_forwarder and urlsplit(proxy).username and urlsplit(proxy).scheme in ("http", "https"):
+            # Chrome gets a proxy without a login: with one, Playwright intercepts every request
+            # and turns the HTTP cache off (see app/proxy_forwarder.py).
+            slot.forwarder = ProxyForwarder(proxy)
+            opts["proxy"] = {"server": await slot.forwarder.start()}
+        elif proxy:
             opts["proxy"] = to_playwright(proxy)
         state = self.s.repo_state_file
         if state and Path(state).exists():
@@ -300,15 +323,38 @@ class BrowserManager:
             log.warning("slot=%d exit-IP check named no timezone (EXIT_IP_CHECK_URL should return JSON with one, "
                         "e.g. https://ipinfo.io/json); timezone: %s", slot.index, fixed_tz or "the host's")
         slot.timezone = opts.get("timezone_id")
+        slot.served_results = False
         if self.s.repo_fingerprint:
             await slot.context.add_init_script(REPO_FINGERPRINT_JS)
-        if self.s.block_resources:
-            await slot.context.route("**/*", self._block)
         slot.page = await slot.context.new_page()
         slot.net = NetworkWatch()
-        await slot.net.attach(slot.context, slot.page)
+        blocked = [p.strip() for p in self.s.blocked_url_patterns.split(",") if p.strip()] if self.s.block_resources else []
+        await slot.net.attach(slot.context, slot.page, blocked)
         slot.proxy_template, slot.proxy, slot.locale = template, proxy, locale
         slot.created, slot.retire = time.monotonic(), None
+        await self._warm_up(slot)
+
+    async def _warm_up(self, slot: Slot) -> None:
+        """Open WARMUP_URLS in the new session before its first search (a cold session gets
+        Google's results far less often than one that has browsed a few pages first). A page
+        that fails is skipped; the traffic is logged, as it goes through the proxy."""
+        urls = [u.strip() for u in self.s.warmup_urls.split(",") if u.strip()]
+        if not urls or slot.page is None:
+            return
+        t0, start_bytes = time.monotonic(), slot.net.bytes if slot.net else 0
+        opened = 0
+        for url in urls:
+            try:
+                await slot.page.goto(url, wait_until="domcontentloaded", timeout=self.s.nav_timeout_ms)
+                opened += 1
+                # A visitor answers Google's consent dialog instead of browsing on with it open.
+                await reject_consent(slot.page)
+                lo, hi = sorted((self.s.warmup_dwell_min_ms, self.s.warmup_dwell_max_ms))
+                await slot.page.wait_for_timeout(random.randint(lo, hi))
+            except Exception as e:  # a warm-up page never fails the session
+                log.warning("slot=%d warm-up page %s failed: %s", slot.index, url, str(e).splitlines()[0][:120])
+        warm_bytes = (slot.net.bytes if slot.net else 0) - start_bytes
+        log.info("slot=%d warmup done pages=%d/%d bytes=%d ms=%d", slot.index, opened, len(urls), warm_bytes, (time.monotonic() - t0) * 1000)
 
     def _rebuild_reason(self, slot: Slot, template: str | None, locale: str) -> str | None:
         if slot.context is None:
@@ -355,7 +401,7 @@ class BrowserManager:
             await self._prepare(slot, country, language)
             slot.uses += 1
             yield slot
-            if self.s.exit_ip_check_url:
+            if self.s.exit_ip_check_url and self.s.exit_ip_check_after:
                 after = await self.exit_ip(slot)
                 slot.report["exit_ip_after"] = after
                 if after and slot.exit_ip and after != slot.exit_ip:
