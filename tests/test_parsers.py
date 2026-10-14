@@ -303,11 +303,43 @@ def test_renamed_old_source_cards_are_read():
     assert parsed.sources[0].title == "T-Mobile"
 
 
-def test_an_overview_without_a_source_panel_is_complete():
-    # 'chase bank login': the overview shows only an inline link, no source cards (checked on the screenshot)
+def test_an_inline_link_is_a_source_when_there_is_no_source_panel():
+    # 'chase bank login': no source cards, but the response text links its source itself
     parsed, ctx = _aio_with_all_links_resolved("aio_sources/chase_no_sources.html")
-    assert parsed.sections and parsed.sources == [] and not ctx.gaps
-    assert "AI Overview shows no source cards" in ctx.warnings
+    assert parsed.sections and not ctx.gaps
+    assert [(s.title, s.snippet) for s in parsed.sources] == [("Chase Online Sign In", None)]
+
+
+def test_citation_chips_and_inline_links_are_sources():
+    # 'chase bank login' in the Poland run: no panel; an inline link plus citation chips
+    # (span.WBgIic > a.PMDqCb). The chip that shares the inline link's URL, and the repeated
+    # Hapres chip, are listed once; a chip to a Google host (Google Play) stays a source.
+    parsed, ctx = _aio_with_all_links_resolved("aio_sources/chase_citation_chips.html")
+    assert not ctx.gaps
+    assert [s.title for s in parsed.sources] == ["Chase Online Banking Portal", "Google Play", "MedCrave online", "Hapres"]
+    assert parsed.sources[1].url == "https://play.google.com/store/apps/details?id=com.chase.sig.android"
+    assert len({s.url for s in parsed.sources}) == 4
+    assert sum("more source(s) behind it" in w for w in ctx.warnings) == 2  # the "+1" chips, not expanded
+
+
+def test_google_ui_links_in_the_overview_are_not_sources():
+    # "Learn more" / policy links are UI; with nothing else linked the overview has no source
+    html = (FIXTURES / "aio_sources/chase_no_sources.html").read_text(encoding="utf-8")
+    html = html.replace('class="H23r4e"', 'class="NotACitation"').replace("/goto?url=", "/search?q=")
+    ctx = ParseContext()
+    parsed = parse_aio(find_aio_root(HTMLParser(html)), ctx)
+    assert all("google.com" not in s.url or "/search" in s.url for s in parsed.sources)
+
+
+def test_citation_chips_in_an_unknown_layout_are_a_gap():
+    # chips renamed and the inline link turned into a Google UI link: markup that cites
+    # something is there, no source is read, so it must not pass as an overview without sources
+    html = (FIXTURES / "aio_sources/chase_citation_chips.html").read_text(encoding="utf-8")
+    html = html.replace('class="PMDqCb"', 'class="Zz9new"').replace('class="H23r4e"', 'class="Zz9inline"')
+    html = html.replace("/goto?url=", "/search?q=")
+    ctx = ParseContext()
+    parsed = parse_aio(find_aio_root(HTMLParser(html)), ctx)
+    assert parsed.sources == [] and any("not recognised" in g.reason for g in ctx.gaps)
 
 
 def test_source_cards_in_an_unknown_layout_are_a_gap():

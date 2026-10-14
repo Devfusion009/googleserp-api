@@ -155,6 +155,33 @@ async def test_ip_change_during_a_request_is_recorded_and_the_session_retired():
     assert report["ip_checks"] == 2 and report["ip_check_bytes"] == 2 * one
 
 
+async def test_an_unreachable_proxy_keeps_the_session_and_rechecks_its_ip():
+    # live q41: the route to the proxy dropped for ~1 s; Google saw nothing, so the session
+    # (cookies, exit IP, warm-up) is kept rather than rebuilt with a new first search
+    from playwright.async_api import Error as PlaywrightError
+    m = manager()
+    slot = await use(m)
+    slot.ip_checked_at = 1.0
+    with pytest.raises(PlaywrightError):
+        async with m.page("US", "en"):
+            raise PlaywrightError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://www.google.com/")
+    assert slot.context is not None and not m.browser.contexts[0].closed
+    assert slot.ip_checked_at is None  # the exit IP is checked again before the next request
+    await use(m)
+    assert len(m.browser.contexts) == 1
+
+
+async def test_any_other_browser_error_still_rebuilds_the_session():
+    from playwright.async_api import Error as PlaywrightError
+    m = manager()
+    await use(m)
+    with pytest.raises(PlaywrightError):
+        async with m.page("US", "en"):
+            raise PlaywrightError("Target page, context or browser has been closed")
+    await use(m)
+    assert len(m.browser.contexts) == 2 and m.browser.contexts[0].closed
+
+
 async def test_a_failed_ip_check_is_unknown_not_a_change():
     m = manager(ips=["203.0.113.1", "", ""], exit_ip_check_url="https://ip.example/")
     slot = await use(m)

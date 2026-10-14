@@ -114,6 +114,21 @@ class PageSlot(Protocol):
     report: dict  # this request's proxy-session facts (session id, exit IPs)
 
 
+# Chrome errors that mean the request never got past the proxy (live q41, 2026-10-10: the
+# route to the proxy gateway dropped for ~1 s, "[Errno 101] Network is unreachable").
+# Google saw nothing, so the session - its cookies and exit IP - is still good.
+PROXY_UNREACHABLE_ERRORS = (
+    "net::ERR_TUNNEL_CONNECTION_FAILED",
+    "net::ERR_PROXY_CONNECTION_FAILED",
+    "net::ERR_INTERNET_DISCONNECTED",
+    "net::ERR_NETWORK_CHANGED",
+)
+
+
+def proxy_unreachable(text: str | None) -> bool:
+    return any(e in (text or "") for e in PROXY_UNREACHABLE_ERRORS)
+
+
 class PagePool(Protocol):
     """What Fetcher needs from its browser pool - checking a slot in and out.
     BrowserManager satisfies this structurally; so does a test double (see
@@ -409,7 +424,14 @@ class BrowserManager:
                     slot.retire = f"exit IP changed during a request ({slot.exit_ip} -> {after})"
                     log.warning("slot=%d %s", slot.index, slot.retire)
                 slot.exit_ip = after or slot.exit_ip
-        except Exception:
+        except Exception as e:
+            if slot.context is not None and proxy_unreachable(str(e)):
+                # The proxy could not be reached: keep the session, but check its exit IP
+                # again before the next request (a rebuilt context would mean a new warm-up
+                # and a first search, the riskiest search for a CAPTCHA).
+                slot.ip_checked_at = None
+                log.warning("slot=%d proxy unreachable, session kept: %s", slot.index, str(e).splitlines()[0][:120])
+                raise
             # a broken page/context is rebuilt next time
             if slot.context:
                 try:

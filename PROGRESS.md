@@ -461,8 +461,12 @@ Three parsing problems from the Poland run (18 of the 41 returned pages):
 2. "No source cards" (6 PL + 2 US): Google's newer panel (div[role=listitem] cards with
    a.POYEld, .vFyWT, .BEwxRe) and the old card <li> renamed h7wxwc -> Ioqnib. Both read;
    cards shaped like source links in an unknown layout stay a gap; an overview with no
-   source panel at all (chase bank login - checked on the screenshot) is complete with
-   sources [] and a warning.
+   source panel reads the sources it cites inline (inline links and citation chips); only an overview with no
+   citation at all is complete with sources [] and a warning.
+   CORRECTION (2026-10-12): the first version of this rule was wrong for chase bank login. That page
+   has no panel but does cite sources inline (inline link + chips), and the collector returned
+   sources [] with classification ok. Fixed in app/parsers/aio.py; chips whose link is in an unknown
+   shape are a gap. Not yet measured live (needs /goto resolution).
 3. Ad sub-links behind /goto unresolved (3): the token-collecting first pass stopped at
    an ad whose own link was an unresolved /goto, so its sub-links were never collected.
    Now collected; a parametrized test checks on every fixture that the second pass asks

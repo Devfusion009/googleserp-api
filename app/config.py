@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     aio_click_timeout_ms: int = 4000  # per 'Show more/all' click attempt (still bounded by aio_max_wait_ms)
     request_deadline_ms: int = 25000
     max_retries: int = 0
+    # Extra attempts when the proxy could not be reached at all (Google saw nothing), after a
+    # random pause, on the same session, while the call is still within request_deadline_ms.
+    proxy_unreachable_retries: int = 1
+    proxy_unreachable_pause_ms: tuple[int, int] = (1000, 2000)
     goto_concurrency: int = 16
     goto_timeout_ms: int = 3000
     # Resolve the result links already on the page while the AI Overview loads.

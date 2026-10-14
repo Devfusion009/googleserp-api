@@ -558,6 +558,8 @@ Environment variables take precedence over `.env`.
 | `AIO_CLICK_TIMEOUT_MS` | `4000` | Per *Show more* / *Show all* click attempt. |
 | `REQUEST_DEADLINE_MS` | `25000` | Hard cap per page load. After that, `timeout`. |
 | `MAX_RETRIES` | `0` | Retries for `timeout` / `network_error` only. Never for a CAPTCHA. |
+| `PROXY_UNREACHABLE_RETRIES` | `1` | Extra attempts, on the same session, when the proxy could not be reached at all (`net::ERR_TUNNEL_CONNECTION_FAILED` and similar: Google saw nothing). Only while the call is within `REQUEST_DEADLINE_MS`; the retry's requests, traffic and time count in the response. `0` turns it off. |
+| `PROXY_UNREACHABLE_PAUSE_MS` | `[1000,2000]` | Random pause before that retry. |
 | `GOTO_CONCURRENCY` | `16` | `/goto` links resolved in parallel per page. |
 | `GOTO_TIMEOUT_MS` | `3000` | Timeout for one `/goto` resolution. |
 | `GOTO_PREFETCH` | `true` | Resolve links already on the page while the AI Overview loads. |

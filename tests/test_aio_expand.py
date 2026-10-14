@@ -12,7 +12,7 @@ import re
 from playwright.async_api import Error as PlaywrightError
 
 from app.config import Settings
-from app.fetcher import AIO_PROBE_JS, Fetcher
+from app.fetcher import AIO_PROBE_JS, MARK_HIDDEN_JS, UNMARK_HIDDEN_JS, Fetcher
 
 
 class FakeLocator:
@@ -39,18 +39,29 @@ class FakeLocator:
             self.page.len += 500
 
 
+COMPLETE_HTML = ('<html><body><div><h2>AI Overview</h2><div class="n6owBd">' + "An answer. " * 30
+                 + "</div></div></body></html>")
+PLACEHOLDER_HTML = "<html><body><div><h2>AI Overview</h2><div>AI Mode reply for x</div></div></body></html>"
+
+
 class FakePage:
     url = "https://www.google.com/search?q=x"
 
     def __init__(self, buttons):
+        self.html = COMPLETE_HTML  # what page.content() returns: the classifier's view of the page
         self.len = 1200
         self.answer = True  # the block holds answer text (paragraph, section heading or bullet)
         self.clicks = []
         self.buttons = {str(i): {"label": label, "visible": True, "expanded": None, "on_click": list(behaviours)}
                         for i, (label, behaviours) in enumerate(buttons, 1)}
 
+    async def content(self):
+        return self.html
+
     async def evaluate(self, js, *args):
-        assert js == AIO_PROBE_JS
+        if js != AIO_PROBE_JS:
+            assert js in (MARK_HIDDEN_JS, UNMARK_HIDDEN_JS)
+            return 0
         return {
             "present": True, "len": self.len, "busy": False, "answer": self.answer,
             "buttons": [{"id": i, "label": b["label"], "visible": b["visible"], "expanded": b["expanded"]}
@@ -184,6 +195,43 @@ async def test_a_placeholder_shell_that_fills_in_late_is_complete():
     assert page.len == 1200
 
 
+# --- the probe says done, the HTML the classifier reads says placeholder (live q18) ---
+
+async def test_the_wait_does_not_end_while_the_classifier_still_sees_the_placeholder():
+    # Poland q18 (2026-10-10): the probe took the block as answered after 554 ms, the
+    # captured HTML held only "AI Mode reply for ...", the answer streamed in after.
+    page, net = FakePage([]), FakeNet(done=1)
+    page.html = PLACEHOLDER_HTML
+
+    async def answer_arrives():
+        await asyncio.sleep(1.0)
+        page.html = COMPLETE_HTML
+
+    task = asyncio.create_task(answer_arrives())
+    ok, reason = await fetcher()._wait_aio(page, net)
+    seen_when_done = page.html
+    await task
+    assert ok and reason == "AI Overview complete"
+    assert seen_when_done == COMPLETE_HTML  # it waited for the answer
+
+
+async def test_a_placeholder_the_classifier_sees_until_the_deadline_is_incomplete():
+    page, net = FakePage([]), FakeNet(done=1)
+    page.html = PLACEHOLDER_HTML
+    ok, reason = await fetcher(max_wait_ms=900)._wait_aio(page, net)
+    assert not ok and "still loading after 900 ms" in reason and "placeholder" in reason
+
+
+async def test_an_unreadable_page_falls_back_to_the_probe():
+    page = FakePage([])
+
+    async def content():
+        raise PlaywrightError("Target page, context or browser has been closed")
+    page.content = content
+    ok, reason = await fetcher()._wait_aio(page)
+    assert ok and reason == "AI Overview complete"
+
+
 # --- controls whose code Google lazy-loads (mobile run 2026-10-05, "how does dns work") ---
 
 class ScriptNet(FakeNet):
@@ -261,7 +309,7 @@ async def test_a_show_all_whose_cards_are_already_in_the_page_is_not_clicked():
 
     async def evaluate(js, *args):
         probe = await real_evaluate(js, *args)
-        for b in probe["buttons"]:
+        for b in probe["buttons"] if isinstance(probe, dict) else ():
             b["hiddenCards"] = 6 if b["label"] == "Show all" else 0
         return probe
 

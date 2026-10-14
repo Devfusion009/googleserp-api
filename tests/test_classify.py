@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from app.classify import AioState, Classification, classify_page
+from selectolax.parser import HTMLParser
+
+from app.classify import AioState, Classification, aio_loading, classify_page
 
 F = Path(__file__).parent / "fixtures" / "classifier"
 SERP = "https://www.google.com/search?q=x&gl=us&hl=en"
@@ -39,6 +41,20 @@ def test_aio_loading_is_incomplete():
     v = classify_page(SERP, read("synthetic_aio_loading.html"), organic_count=1)
     assert v.classification is Classification.aio_incomplete
     assert v.aio_state is AioState.incomplete
+
+
+def test_aio_loading_says_why_a_placeholder_is_still_loading():
+    # live q18 (Poland, 2026-10-10): captured on the 'AI Mode reply' placeholder while the
+    # answer was still streaming in (the screenshot taken just after shows it)
+    why = aio_loading(HTMLParser(read("real_aio_placeholder_streaming.html")))
+    assert why is not None and "placeholder" in why
+
+
+def test_aio_loading_is_none_when_complete_absent_or_failed():
+    complete = '<div><h2>AI Overview</h2><div class="n6owBd">' + "An answer. " * 30 + "</div></div>"
+    failed = '<div><h2>AI Overview</h2><span>An AI Overview is not available for this search</span>' + "<p>x</p>" * 3 + "</div>"
+    for html in (complete, "<div>no overview</div>", failed):
+        assert aio_loading(HTMLParser(f"<html><body>{html}</body></html>")) is None
 
 
 def test_plain_results_ok_without_aio():

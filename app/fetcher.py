@@ -21,8 +21,8 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from selectolax.parser import HTMLParser
 
-from .browser import PagePool, PageSlot
-from .classify import HIDDEN_MARK, AioState, Classification, classify_page
+from .browser import PagePool, PageSlot, proxy_unreachable
+from .classify import HIDDEN_MARK, AioState, Classification, aio_loading, classify_page
 from .config import Settings
 from .consent import reject_consent
 from .goto_resolver import GotoResolution, resolve_goto
@@ -190,6 +190,28 @@ MARK_HIDDEN_JS = r"""
 }
 """
 
+# Undoes MARK_HIDDEN_JS: the wait checks the page mid-load, and a mark left on an element
+# that is shown later would hide it from the classifier in the final capture.
+UNMARK_HIDDEN_JS = r"""
+(mark) => { for (const el of document.querySelectorAll('[' + mark + ']')) el.removeAttribute(mark); }
+"""
+
+
+async def _aio_still_loading(page: Page) -> str | None:
+    """The classifier's verdict on the page as it is now (aio_loading), with hidden elements
+    marked exactly as for the final capture. None if the page can't be read: the wait then
+    goes by its own probe, as before."""
+    try:
+        await page.evaluate(MARK_HIDDEN_JS, HIDDEN_MARK)
+        try:
+            html = await _page_html(page)
+        finally:
+            await page.evaluate(UNMARK_HIDDEN_JS, HIDDEN_MARK)
+    except PlaywrightError as e:
+        log.warning("AI Overview check on the page HTML skipped: %s", str(e).splitlines()[0][:120])
+        return None
+    return aio_loading(HTMLParser(html))
+
 
 @dataclass
 class FetchResult:
@@ -257,20 +279,36 @@ class Fetcher:
 
     async def fetch(self, url: str, country: str | None, language: str | None) -> FetchResult:
         attempts = 1 + max(0, self.s.max_retries)
+        unreachable_retries = max(0, self.s.proxy_unreachable_retries)
         result = None
         usage: Counter = Counter()
         traffic: Counter = Counter()
         partial = ip_changed = False
-        for attempt in range(attempts):
+        t0 = time.perf_counter()
+        attempt = 0
+        while True:
             result = await self._fetch_once(url, country, language)
             usage.update(result.usage)
             traffic.update({k: result.timings[k] for k in TRAFFIC_KEYS if k in result.timings})
             partial = partial or bool(result.timings.get("bytes_in_partial"))
             ip_changed = ip_changed or bool(result.session.get("ip_changed"))
-            result.timings["attempt"] = attempt + 1
+            attempt += 1
+            result.timings["attempt"] = attempt
             if result.classification not in (Classification.timeout, Classification.network_error):
                 break
-            log.warning("retryable failure %s (attempt %d/%d)", result.classification.value, attempt + 1, attempts)
+            if attempt < attempts:
+                log.warning("retryable failure %s (attempt %d/%d)", result.classification.value, attempt, attempts)
+                continue
+            if result.classification is Classification.network_error and unreachable_retries and proxy_unreachable(result.reason):
+                lo, hi = sorted(self.s.proxy_unreachable_pause_ms)
+                pause_ms = random.randint(lo, hi)
+                # Only if a retry still fits the call's deadline; the pause counts in its latency.
+                if _ms(t0) + pause_ms < self.s.request_deadline_ms:
+                    unreachable_retries -= 1
+                    log.warning("proxy unreachable (attempt %d), retrying on the same session in %d ms", attempt, pause_ms)
+                    await asyncio.sleep(pause_ms / 1000)
+                    continue
+            break
         # A retry costs requests and traffic too: report the totals, not the last attempt's.
         result.usage = dict(usage)
         result.timings.update(traffic)
@@ -523,6 +561,7 @@ class Fetcher:
         last_len, stable_since = -1, time.perf_counter()
         pending: list[dict] = []
         shell = False
+        loading_why: str | None = None  # the classifier's reason, when it disagreed with the probe
         while time.perf_counter() < end:
             probe = await page.evaluate(AIO_PROBE_JS)
             if not probe["present"]:
@@ -541,7 +580,14 @@ class Fetcher:
             elif now - stable_since >= STABLE_S:
                 pending = _pending_expanders(probe, done)
                 if not pending:
-                    return True, "AI Overview complete"
+                    # The probe's answer check is looser than the classifier's: confirm on
+                    # the HTML the classifier will read, and keep waiting if it disagrees.
+                    loading_why = await _aio_still_loading(page)
+                    if loading_why is None:
+                        return True, "AI Overview complete"
+                    last_len, stable_since = -1, time.perf_counter()
+                    await page.wait_for_timeout(100)
+                    continue
                 # 3) expand: click, then wait until the page shows the effect.
                 button = pending[0]
                 label, bid = button["label"], button["id"]
@@ -573,6 +619,8 @@ class Fetcher:
         if shell:
             return False, (f"AI Overview still loading after {self.s.aio_max_wait_ms} ms: "
                            "only the 'AI Mode reply' placeholder, no answer text")
+        if loading_why is not None and not pending:
+            return False, f"AI Overview still loading after {self.s.aio_max_wait_ms} ms: {loading_why}"
         left = ", ".join(f"'{b['label']}' ({problem.get(b['id'], 'not clicked yet')})" for b in pending)
         return False, f"AI Overview not finished within {self.s.aio_max_wait_ms} ms" + (f"; not expanded: {left}" if left else "")
 

@@ -174,6 +174,22 @@ def aio_state(tree: HTMLParser) -> tuple[AioState, str]:
     return AioState.complete, "AI Overview text present"
 
 
+def aio_loading(tree: HTMLParser) -> str | None:
+    """Why the AI Overview still counts as loading under aio_state's rules, or None when
+    it is complete or absent, or shows Google's failure text (waiting won't change that).
+    The fetcher's wait asks this before ending, so it never stops on a page the classifier
+    would then call incomplete (live q18 2026-10-10: the wait ended at 554 ms on the
+    'AI Mode reply' placeholder while the answer was still streaming in)."""
+    root = find_aio_root(tree)
+    if root is None:
+        return None
+    text = visible_text(root)
+    if any(t in text for t in AIO_FAILED_TEXT):
+        return None
+    state, why = aio_state(tree)
+    return why if state is AioState.incomplete else None
+
+
 def _has_answer(root: Node) -> bool:
     """Does the AI Overview block hold answer text (intro or a section), as the
     AIO parser reads it? Parses a copy - parse_aio edits the tree it is given."""
